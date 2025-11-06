@@ -1,0 +1,4 @@
+60
+100
+Continuous
+Ready

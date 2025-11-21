@@ -1,0 +1,16 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Requirements file
+requirements.txt
+
+# Second cure defaults
+second_cure_defaults.txt
+
+# Build artifacts
+dist/
+build/
+*.spec

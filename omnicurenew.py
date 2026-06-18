@@ -1,13 +1,16 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-import serial
-import serial.tools.list_ports
+import serial  # type: ignore
+import serial.tools.list_ports  # type: ignore
 import threading
 import time
+import json
 import os
+import sys
+import ctypes
 
 class OmnicureGUI:
-    PASSWORD = "1234@"  # password required to enter Update Settings
+    PASSWORD = "1234@"  # password required for second cure settings
 
     def __init__(self, root):
         self.root = root
@@ -15,29 +18,21 @@ class OmnicureGUI:
         self.root.geometry("1200x750")
         self.root.resizable(True, True)
         self.root.configure(bg='#ffffff')  # Light background
+        self.root.lift()  # Bring window to front
+        self.root.attributes('-topmost', True)  # Keep on top initially
+        self.root.after_idle(lambda: self.root.attributes('-topmost', False))  # Then allow normal behavior
         
-        # Set window icon (if available)
-        try:
-            self.root.iconbitmap('icon.ico')
-        except:
-            pass
-
-        # ensure defaults file exists
-        self.settings_file = "omnicure_settings.txt"
-        if not os.path.exists(self.settings_file):
-            with open(self.settings_file, "w") as f:
-                f.write("120\n50\n2\n10\n")
-        
-        # Set initial values for first cure
-        self.first_cure_initial_values = ["120", "50", "2", "10"]
+        self.app_logo_image = None
 
         # Modern styling
         self.setup_styles()
+        self._setup_app_icon()
 
         self.serial_port = None
         self.serial_connected = False
         self.running = False
         self.live_thread = None
+        self.cure_finishing = False
         self.current_cure_step = 0  # 0=none, 1=first cure, 2=second cure
         self.message_blink_state = False  # For blinking messages
         self.blink_after_id = None  # To cancel blinking
@@ -49,24 +44,23 @@ class OmnicureGUI:
         self.cure_duration = None
         self.current_cure_type = None
 
-        # First cure settings
-        self.first_cure_labels = [
-            "Total Cure Time (sec)",
-            "Pulse Time Percentage (%)",
-            "Pulsing Frequency (Hz)",
-            "Intensity Ramp Step (%)"
-        ]
-        # Set default values directly to StringVars
-        self.first_cure_vars = [
-            tk.StringVar(value="120"),
-            tk.StringVar(value="50"),
-            tk.StringVar(value="2"),
-            tk.StringVar(value="10")
-        ]
-        self.first_cure_blink_var = tk.StringVar()
-        # Add intensity and time tracking for first cure
+        # First cure settings (lensing station step workflow)
+        self.first_cure_settings_file = self._get_lensing_settings_path()
+        self.connection_settings_file = self._get_connection_settings_path()
+        self._loading_first_cure_settings = False
+        self.first_cure_stay_var = tk.StringVar(value="")
+        self.first_cure_steps_summary_var = tk.StringVar(value="")
+        self.first_cure_step_vars = []
+        self.first_cure_step_rows = []
+        self.first_cure_steps_table = None
+        self.first_cure_step_count_var = tk.StringVar(value="(1)")
+        self.first_cure_add_step_button = None
+        self.first_cure_remove_step_button = None
+        self.first_cure_save_button = None
+        self.first_cure_stay_entry = None
         self.first_cure_intensity_var = tk.StringVar(value="0%")
         self.first_cure_time_var = tk.StringVar(value="0.000")
+        self._init_first_cure_settings()
         
         # Second cure settings (fixed for 60 sec, 100% intensity, continuous)
         self.second_cure_labels = [
@@ -98,7 +92,6 @@ class OmnicureGUI:
         self.create_first_cure_settings_widgets()
         self.create_second_cure_settings_widgets()
 
-        self.load_defaults_to_display()
         self.refresh_com_ports()
         # Auto-connect to OMNICURE device on startup
         self.root.after(1000, self.auto_connect_omnicure)
@@ -236,14 +229,370 @@ class OmnicureGUI:
                        foreground=self.colors['white'],
                        background=self.colors['running'])
 
+    def _get_asset_path(self, filename):
+        if getattr(sys, 'frozen', False):
+            base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, filename)
+
+    def _setup_app_icon(self):
+        if sys.platform == 'win32':
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    'Metrohm.OMNICURE.LX500.Lensing'
+                )
+            except Exception:
+                pass
+
+        icon_path = self._get_asset_path("lx500_icon.png")
+        if os.path.exists(icon_path):
+            try:
+                self.app_logo_image = tk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, self.app_logo_image)
+            except Exception:
+                self.app_logo_image = None
+
+        if sys.platform == 'win32':
+            ico_path = self._get_asset_path("lx500_icon.ico")
+            if os.path.exists(ico_path):
+                try:
+                    self.root.iconbitmap(default=ico_path)
+                except Exception:
+                    pass
+
+    def _get_lensing_settings_path(self):
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "lensing_gui_settings.json")
+
+    def _get_connection_settings_path(self):
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "connection_settings.json")
+
+    def _load_saved_com_port(self):
+        try:
+            if os.path.exists(self.connection_settings_file):
+                with open(self.connection_settings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return str(data.get("saved_com_port", "")).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _save_com_port_to_file(self, port):
+        try:
+            with open(self.connection_settings_file, "w", encoding="utf-8") as f:
+                json.dump({"saved_com_port": port}, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("❌ Error", f"Could not save COM port: {e}")
+            return False
+        return True
+
+    def save_com_port_settings(self):
+        port = self.selected_com_port.get().strip()
+        if not port:
+            messagebox.showwarning("⚠️ No Port Selected", "Please select a COM port first.")
+            return
+        if self._save_com_port_to_file(port):
+            messagebox.showinfo("✅ Saved", f"COM port {port} saved. App will use this port on startup.")
+
+    def _default_first_cure_step_data(self):
+        return {"intensity": "5", "on_time": "", "off_time": "", "increment": "1"}
+
+    def _init_first_cure_settings(self):
+        self._loading_first_cure_settings = True
+        self._load_first_cure_settings_from_file()
+        self._build_first_cure_step_vars(self._stored_first_cure_steps)
+        self._loading_first_cure_settings = False
+        self._update_first_cure_display_summary()
+
+    def _load_first_cure_settings_from_file(self):
+        default_steps = [self._default_first_cure_step_data()]
+        try:
+            if os.path.exists(self.first_cure_settings_file):
+                with open(self.first_cure_settings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                stay = str(data.get("stay_at_100", "")).strip()
+                steps = data.get("steps", default_steps) or default_steps
+                cleaned = []
+                for step in steps:
+                    cleaned.append({
+                        "intensity": str(step.get("intensity", "")).strip(),
+                        "on_time": str(step.get("on_time", "")).strip(),
+                        "off_time": str(step.get("off_time", "")).strip(),
+                        "increment": str(step.get("increment", "1")).strip() or "1",
+                    })
+                if not cleaned:
+                    cleaned = default_steps
+                cleaned[0]["intensity"] = "5"
+                self.first_cure_stay_var.set(stay)
+                self._stored_first_cure_steps = cleaned
+                return
+        except Exception:
+            pass
+        self.first_cure_stay_var.set("")
+        self._stored_first_cure_steps = default_steps
+
+    def _build_first_cure_step_vars(self, steps_data):
+        self.first_cure_step_vars = []
+        for step in steps_data:
+            step_vars = {
+                "intensity": tk.StringVar(value=step.get("intensity", "")),
+                "on_time": tk.StringVar(value=step.get("on_time", "")),
+                "off_time": tk.StringVar(value=step.get("off_time", "")),
+                "increment": tk.StringVar(value=step.get("increment", "1") or "1"),
+            }
+            step_vars["intensity"].trace_add("write", self._on_first_cure_setting_changed)
+            step_vars["on_time"].trace_add("write", self._on_first_cure_setting_changed)
+            step_vars["off_time"].trace_add("write", self._on_first_cure_setting_changed)
+            step_vars["increment"].trace_add("write", self._on_first_cure_setting_changed)
+            self.first_cure_step_vars.append(step_vars)
+        if self.first_cure_step_vars:
+            self.first_cure_step_vars[0]["intensity"].set("5")
+        self.first_cure_stay_var.trace_add("write", self._on_first_cure_setting_changed)
+
+    def _on_first_cure_setting_changed(self, *_args):
+        if self._loading_first_cure_settings:
+            return
+        if self.first_cure_step_vars:
+            self.first_cure_step_vars[0]["intensity"].set("5")
+        self._persist_first_cure_settings()
+        self._update_first_cure_display_summary()
+
+    def _persist_first_cure_settings(self):
+        steps = []
+        for step in self.first_cure_step_vars:
+            steps.append({
+                "intensity": step["intensity"].get().strip(),
+                "on_time": step["on_time"].get().strip(),
+                "off_time": step["off_time"].get().strip(),
+                "increment": step["increment"].get().strip() or "1",
+            })
+        if steps:
+            steps[0]["intensity"] = "5"
+        data = {
+            "stay_at_100": self.first_cure_stay_var.get().strip(),
+            "steps": steps,
+        }
+        try:
+            with open(self.first_cure_settings_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _update_first_cure_display_summary(self):
+        lines = []
+        for i, step in enumerate(self.first_cure_step_vars, start=1):
+            intensity = step["intensity"].get().strip() or "-"
+            on_time = step["on_time"].get().strip() or "-"
+            off_time = step["off_time"].get().strip() or "-"
+            increment = step["increment"].get().strip() or "1"
+            lines.append(
+                f"Step {i}: {intensity}% | ON {on_time}s | OFF {off_time}s | +{increment}%"
+            )
+        summary = "\n".join(lines) if lines else "No steps configured"
+        self.first_cure_steps_summary_var.set(summary)
+
+    def _parse_first_cure_settings(self):
+        stay_raw = self.first_cure_stay_var.get().strip()
+        if not stay_raw:
+            raise ValueError("Please enter Stay at 100% Intensity Time (sec)")
+        stay_at_100 = float(stay_raw)
+        if stay_at_100 < 0:
+            raise ValueError("Stay at 100% time cannot be negative.")
+
+        if not self.first_cure_step_vars:
+            raise ValueError("Please configure at least one cure step.")
+
+        steps = []
+        for i, step in enumerate(self.first_cure_step_vars, start=1):
+            intensity_raw = step["intensity"].get().strip()
+            on_raw = step["on_time"].get().strip()
+            off_raw = step["off_time"].get().strip()
+            inc_raw = step["increment"].get().strip() or "1"
+            if not on_raw or not off_raw:
+                raise ValueError(f"Please enter ON and OFF time for step {i}.")
+            if i > 1 and not intensity_raw:
+                raise ValueError(f"Please enter intensity for step {i}.")
+            intensity = float(intensity_raw if intensity_raw else "5")
+            on_time = float(on_raw)
+            off_time = float(off_raw)
+            increment = float(inc_raw)
+            if on_time <= 0 or off_time <= 0 or increment <= 0:
+                raise ValueError(f"Step {i} values must be greater than zero.")
+            steps.append({
+                "intensity": intensity,
+                "on_time": on_time,
+                "off_time": off_time,
+                "increment": increment,
+            })
+
+        steps.sort(key=lambda s: s["intensity"])
+        if steps[0]["intensity"] != 5:
+            raise ValueError("First step intensity must be 5%.")
+        for i in range(1, len(steps)):
+            if steps[i]["intensity"] <= steps[i - 1]["intensity"]:
+                raise ValueError("Step intensities must increase (e.g. 5, 10, 20).")
+
+        return stay_at_100, steps
+
+    def _build_first_cure_pulse_sequence(self, steps):
+        sequence = []
+        for i in range(len(steps)):
+            step = steps[i]
+            if i + 1 < len(steps):
+                next_step = steps[i + 1]
+                current = step["intensity"] + step["increment"] if i > 0 else step["intensity"]
+                while current < next_step["intensity"]:
+                    sequence.append((current, step["on_time"], step["off_time"]))
+                    current += step["increment"]
+                sequence.append((
+                    next_step["intensity"],
+                    next_step["on_time"],
+                    next_step["off_time"],
+                ))
+            else:
+                if len(steps) == 1:
+                    current = step["intensity"]
+                else:
+                    current = step["intensity"] + step["increment"]
+                while current < 100:
+                    sequence.append((current, step["on_time"], step["off_time"]))
+                    current += step["increment"]
+                if not sequence or sequence[-1][0] != 100:
+                    sequence.append((100, step["on_time"], step["off_time"]))
+        return sequence
+
+    def _estimate_first_cure_duration(self, steps, stay_at_100):
+        sequence = self._build_first_cure_pulse_sequence(steps)
+        pulse_time = sum(on_t + off_t for _, on_t, off_t in sequence)
+        return pulse_time + stay_at_100
+
+    def _update_first_cure_step_count(self):
+        self.first_cure_step_count_var.set(f"({len(self.first_cure_step_vars)})")
+
+    def _rebuild_first_cure_step_rows(self):
+        if not self.first_cure_steps_table:
+            return
+
+        for row in self.first_cure_step_rows:
+            for widget in row.get("widgets", []):
+                widget.destroy()
+        self.first_cure_step_rows = []
+
+        entry_width = 10
+        for index, step in enumerate(self.first_cure_step_vars):
+            grid_row = index + 1
+            widgets = []
+
+            step_label = ttk.Label(
+                self.first_cure_steps_table,
+                text=f"{index + 1}.",
+                width=4,
+                font=('Arial', 10),
+                background=self.colors['light'],
+            )
+            step_label.grid(row=grid_row, column=0, padx=(0, 4), pady=2, sticky="w")
+            widgets.append(step_label)
+
+            intensity_entry = ttk.Entry(
+                self.first_cure_steps_table,
+                textvariable=step["intensity"],
+                width=entry_width,
+                style="Modern.TEntry",
+            )
+            intensity_entry.grid(row=grid_row, column=1, padx=4, pady=2, sticky="ew")
+            widgets.append(intensity_entry)
+
+            on_entry = ttk.Entry(
+                self.first_cure_steps_table,
+                textvariable=step["on_time"],
+                width=entry_width,
+                style="Modern.TEntry",
+            )
+            on_entry.grid(row=grid_row, column=2, padx=4, pady=2, sticky="ew")
+            widgets.append(on_entry)
+
+            off_entry = ttk.Entry(
+                self.first_cure_steps_table,
+                textvariable=step["off_time"],
+                width=entry_width,
+                style="Modern.TEntry",
+            )
+            off_entry.grid(row=grid_row, column=3, padx=4, pady=2, sticky="ew")
+            widgets.append(off_entry)
+
+            inc_entry = ttk.Entry(
+                self.first_cure_steps_table,
+                textvariable=step["increment"],
+                width=entry_width,
+                style="Modern.TEntry",
+            )
+            inc_entry.grid(row=grid_row, column=4, padx=4, pady=2, sticky="ew")
+            widgets.append(inc_entry)
+
+            if index == 0:
+                intensity_entry.configure(state="readonly")
+
+            self.first_cure_step_rows.append({
+                "widgets": widgets,
+                "entries": [intensity_entry, on_entry, off_entry, inc_entry],
+            })
+
+        for col in range(1, 5):
+            self.first_cure_steps_table.columnconfigure(col, weight=1, uniform="cure_step_col")
+
+        self._update_first_cure_step_count()
+
+        if self.first_cure_add_step_button:
+            state = "normal" if not self.running else "disabled"
+            self.first_cure_add_step_button.configure(state=state)
+        if self.first_cure_remove_step_button:
+            if self.running or len(self.first_cure_step_vars) <= 1:
+                self.first_cure_remove_step_button.configure(state="disabled")
+            else:
+                self.first_cure_remove_step_button.configure(state="normal")
+
+    def _add_first_cure_step(self):
+        if self.running:
+            return
+        new_step = {
+            "intensity": tk.StringVar(value=""),
+            "on_time": tk.StringVar(value=""),
+            "off_time": tk.StringVar(value=""),
+            "increment": tk.StringVar(value="1"),
+        }
+        for var in new_step.values():
+            var.trace_add("write", self._on_first_cure_setting_changed)
+        self.first_cure_step_vars.append(new_step)
+        self._rebuild_first_cure_step_rows()
+        self._persist_first_cure_settings()
+        self._update_first_cure_display_summary()
+
+    def _remove_last_first_cure_step(self):
+        if self.running or len(self.first_cure_step_vars) <= 1:
+            return
+        self.first_cure_step_vars.pop()
+        self._rebuild_first_cure_step_rows()
+        self._persist_first_cure_settings()
+        self._update_first_cure_display_summary()
+
     def create_main_widgets(self):
-        # Title with icon
         title_frame = ttk.Frame(self.main_frame, style="Main.TFrame")
         title_frame.pack(fill='x', pady=(0, 20))
-        
-        title_label = ttk.Label(title_frame, text="⚡ OMNICURE LX500", 
-                                style="Title.TLabel")
-        title_label.pack()
+
+        title_row = ttk.Frame(title_frame, style="Main.TFrame")
+        title_row.pack()
+        if self.app_logo_image:
+            ttk.Label(title_row, image=self.app_logo_image, background=self.colors['background'])\
+                .pack(side='left', padx=(0, 12))
+        ttk.Label(title_row, text="OMNICURE LX500", style="Title.TLabel").pack(side='left')
 
         # Main content frame
         content_frame = ttk.Frame(self.main_frame, style="Main.TFrame")
@@ -263,13 +612,10 @@ class OmnicureGUI:
                    style="Success.TButton").grid(row=0, column=0, padx=5, pady=5, sticky='ew')
         ttk.Button(first_ctrl_frame, text="⚙️ Update Settings", command=self.show_first_cure_settings, 
                    style="Secondary.TButton").grid(row=0, column=1, padx=5, pady=5, sticky='ew')
-        ttk.Button(first_ctrl_frame, text="🔄 Revert to Default", command=self.revert_first_cure_to_default, 
-                   style="Secondary.TButton").grid(row=0, column=2, padx=5, pady=5, sticky='ew')
         
         # Configure grid weights
         first_ctrl_frame.columnconfigure(0, weight=1)
         first_ctrl_frame.columnconfigure(1, weight=1)
-        first_ctrl_frame.columnconfigure(2, weight=1)
 
         
         
@@ -279,27 +625,25 @@ class OmnicureGUI:
         # First cure settings display with better styling
         first_disp_frame = ttk.Frame(first_cure_frame, style="Main.TFrame")
         first_disp_frame.pack(fill='both', expand=True, padx=15, pady=10)
-        
-        for i, label in enumerate(self.first_cure_labels):
-            # Label
-            ttk.Label(first_disp_frame, text=f"{label}:", style="Header.TLabel")\
-               .grid(row=i, column=0, sticky='w', padx=10, pady=8)
-            # Value with better styling
-            value_label = ttk.Label(first_disp_frame, textvariable=self.first_cure_vars[i], 
-                                   style="Value.TLabel")
-            value_label.grid(row=i, column=1, sticky='w', padx=10, pady=8)
-        
-        # Blink time display
-        ttk.Label(first_disp_frame, text="ON/OFF Time per Blink (sec):", style="Header.TLabel")\
-           .grid(row=len(self.first_cure_labels), column=0, sticky='w', padx=10, pady=8)
-        blink_label = ttk.Label(first_disp_frame, textvariable=self.first_cure_blink_var, 
-                               style="Value.TLabel")
-        blink_label.grid(row=len(self.first_cure_labels), column=1, sticky='w', padx=10, pady=8)
+
+        ttk.Label(first_disp_frame, text="Stay at 100% Intensity Time (sec):", style="Header.TLabel")\
+            .grid(row=0, column=0, sticky='w', padx=10, pady=8)
+        ttk.Label(first_disp_frame, textvariable=self.first_cure_stay_var, style="Value.TLabel")\
+            .grid(row=0, column=1, sticky='w', padx=10, pady=8)
+
+        ttk.Label(first_disp_frame, text="Cure Steps:", style="Header.TLabel")\
+            .grid(row=1, column=0, sticky='nw', padx=10, pady=8)
+        ttk.Label(
+            first_disp_frame,
+            textvariable=self.first_cure_steps_summary_var,
+            style="Value.TLabel",
+            justify='left'
+        ).grid(row=1, column=1, sticky='w', padx=10, pady=8)
 
         # Current intensity display in separate frame
         intensity_frame = ttk.LabelFrame(first_disp_frame, text="⚡ Current Intensity", 
                                         style="Modern.TLabelframe")
-        intensity_frame.grid(row=len(self.first_cure_labels)+1, column=0, columnspan=2, 
+        intensity_frame.grid(row=2, column=0, columnspan=2, 
                             sticky='ew', padx=10, pady=8)
         intensity_label = ttk.Label(intensity_frame, textvariable=self.first_cure_intensity_var, 
                                    style="Value.TLabel")
@@ -308,7 +652,7 @@ class OmnicureGUI:
         # Elapsed time display in separate frame
         time_frame = ttk.LabelFrame(first_disp_frame, text="⏱️ Elapsed Time", 
                                    style="Modern.TLabelframe")
-        time_frame.grid(row=len(self.first_cure_labels)+2, column=0, columnspan=2, 
+        time_frame.grid(row=3, column=0, columnspan=2, 
                        sticky='ew', padx=10, pady=8)
         time_label = ttk.Label(time_frame, textvariable=self.first_cure_time_var, 
                               style="Value.TLabel")
@@ -389,6 +733,10 @@ class OmnicureGUI:
         connect_button = ttk.Button(com_frame, text="🔌 Connect", command=self.manual_connect_selected_port, 
                                   style="Success.TButton")
         connect_button.pack(side='left', padx=(5, 0))
+
+        save_port_button = ttk.Button(com_frame, text="💾 Save Port", command=self.save_com_port_settings,
+                                  style="Secondary.TButton")
+        save_port_button.pack(side='left', padx=(5, 0))
         
         scan_button = ttk.Button(status_frame, text="🔍 Scan All", command=self.manual_check_connection, 
                                 style="Secondary.TButton")
@@ -408,51 +756,92 @@ class OmnicureGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_first_cure_settings_widgets(self):
-        # Title
-        title_label = ttk.Label(self.first_cure_settings_frame, text="⚙️ First Cure Settings", 
+        title_label = ttk.Label(self.first_cure_settings_frame, text="⚙️ First Cure Settings",
                                style="CureHeader.TLabel")
         title_label.pack(pady=20)
 
-        # Settings container
         settings_container = ttk.Frame(self.first_cure_settings_frame, style="Settings.TFrame")
-        settings_container.pack(fill='both', expand=True, padx=30, pady=20)
+        settings_container.pack(fill='both', expand=True, padx=30, pady=10)
 
-        self.first_cure_entries = []
-        for i, label in enumerate(self.first_cure_labels):
-            # Label frame for each setting
-            setting_frame = ttk.Frame(settings_container, style="Settings.TFrame")
-            setting_frame.pack(fill='x', pady=10)
-            
-            ttk.Label(setting_frame, text=f"{label}", 
-                     font=('Arial', 10),
-                     foreground=self.colors['text'],
-                     background=self.colors['light']).pack(anchor='w', pady=(0, 5))
-            
-            # Create entry with current value
-            current_value = self.first_cure_vars[i].get()
-            var = tk.StringVar(value=current_value)
-            entry = ttk.Entry(setting_frame, textvariable=var, width=25, style="Modern.TEntry")
-            entry.pack(fill='x', pady=5)
-            # Configure entry text color explicitly
-            entry.configure(foreground=self.colors['text'])
-            self.first_cure_entries.append(var)
+        stay_frame = ttk.Frame(settings_container, style="Settings.TFrame")
+        stay_frame.pack(fill='x', pady=(0, 15))
+        ttk.Label(stay_frame, text="Stay at 100% Intensity Time (sec)",
+                 font=('Arial', 10),
+                 foreground=self.colors['text'],
+                 background=self.colors['light']).pack(anchor='w', pady=(0, 5))
+        self.first_cure_stay_entry = ttk.Entry(stay_frame, textvariable=self.first_cure_stay_var,
+                                              width=25, style="Modern.TEntry")
+        self.first_cure_stay_entry.pack(fill='x', pady=5)
 
-        # Buttons frame
+        steps_header_bar = ttk.Frame(settings_container, style="Settings.TFrame")
+        steps_header_bar.pack(fill='x', pady=(10, 5))
+        ttk.Label(steps_header_bar, text="Cure Steps",
+                 font=('Arial', 10, 'bold'),
+                 foreground=self.colors['text'],
+                 background=self.colors['light']).pack(side='left')
+        ttk.Label(steps_header_bar, textvariable=self.first_cure_step_count_var,
+                 font=('Arial', 10, 'bold'),
+                 foreground=self.colors['text'],
+                 background=self.colors['light']).pack(side='left', padx=(4, 8))
+        self.first_cure_add_step_button = ttk.Button(
+            steps_header_bar,
+            text="+",
+            width=3,
+            command=self._add_first_cure_step,
+            style="Secondary.TButton",
+        )
+        self.first_cure_add_step_button.pack(side='left', padx=(0, 2))
+        self.first_cure_remove_step_button = ttk.Button(
+            steps_header_bar,
+            text="−",
+            width=3,
+            command=self._remove_last_first_cure_step,
+            style="Secondary.TButton",
+        )
+        self.first_cure_remove_step_button.pack(side='left')
+
+        self.first_cure_steps_table = ttk.Frame(settings_container, style="Settings.TFrame")
+        self.first_cure_steps_table.pack(fill='x', pady=(0, 10))
+
+        headers = ["Step", "Intensity", "ON Time", "OFF Time", "Increment"]
+        for col, label in enumerate(headers):
+            ttk.Label(
+                self.first_cure_steps_table,
+                text=label,
+                font=('Arial', 9, 'bold'),
+                foreground=self.colors['text'],
+                background=self.colors['light'],
+            ).grid(row=0, column=col, padx=4, pady=(0, 6), sticky='ew')
+
         buttons_frame = ttk.Frame(self.first_cure_settings_frame, style="Settings.TFrame")
-        buttons_frame.pack(fill='x', padx=30, pady=30)
-        
-        self.first_cure_save_button = tk.Button(buttons_frame, text="💾 Save Settings", command=self.save_first_cure_settings, 
-                  bg=self.colors['success'], fg=self.colors['white'], font=('Arial', 10), 
-                  relief='raised', bd=2, padx=10, pady=5)
+        buttons_frame.pack(fill='x', padx=30, pady=20)
+
+        self.first_cure_save_button = tk.Button(
+            buttons_frame,
+            text="💾 Save Settings",
+            command=self.save_first_cure_settings,
+            bg=self.colors['success'],
+            fg=self.colors['white'],
+            font=('Arial', 10),
+            relief='raised',
+            bd=2,
+            padx=10,
+            pady=5,
+        )
         self.first_cure_save_button.pack(side='left', padx=5)
-        
-        self.first_cure_revert_button = tk.Button(buttons_frame, text="🔄 Revert to Default", command=self.revert_first_cure_to_default, 
-                  bg=self.colors['primary'], fg=self.colors['white'], font=('Arial', 10), 
-                  relief='raised', bd=2, padx=10, pady=5)
-        self.first_cure_revert_button.pack(side='left', padx=5)
-        
-        ttk.Button(buttons_frame, text="🔙 Back to Main", command=self.show_main_frame, 
+
+        ttk.Label(
+            buttons_frame,
+            text="Settings also save automatically when you change values.",
+            font=('Arial', 9),
+            foreground=self.colors['text_secondary'],
+            background=self.colors['light'],
+        ).pack(side='left', padx=10)
+
+        ttk.Button(buttons_frame, text="🔙 Back to Main", command=self.show_main_frame,
                   style="Secondary.TButton").pack(side='right', padx=5)
+
+        self._rebuild_first_cure_step_rows()
 
     def create_second_cure_settings_widgets(self):
         # Title
@@ -502,21 +891,14 @@ class OmnicureGUI:
                   style="Secondary.TButton").pack(side='right', padx=5)
 
     def show_main_frame(self):
+        self._persist_first_cure_settings()
+        self._update_first_cure_display_summary()
         self.first_cure_settings_frame.pack_forget()
         self.second_cure_settings_frame.pack_forget()
         self.main_frame.pack(fill='both', expand=True)
 
     def show_first_cure_settings(self):
-        pw = simpledialog.askstring("🔐 Password Required", "Enter password to update first cure settings:", show='*')
-        if pw != OmnicureGUI.PASSWORD:
-            messagebox.showerror("❌ Authentication Failed", "Incorrect password.")
-            return
-        
-        # Update entry fields with current values
-        for i, var in enumerate(self.first_cure_entries):
-            current_value = self.first_cure_vars[i].get()
-            var.set(current_value)
-        
+        self._rebuild_first_cure_step_rows()
         self.main_frame.pack_forget()
         self.second_cure_settings_frame.pack_forget()
         self.first_cure_settings_frame.pack(fill='both', expand=True)
@@ -549,7 +931,7 @@ class OmnicureGUI:
         # Disable ALL controls immediately
         self.disable_all_controls()
         # Small delay to ensure GUI updates
-        self.root.after(100, lambda: self.start_live(self.first_cure_vars, "First Cure"))
+        self.root.after(100, lambda: self.start_live("First Cure"))
 
     def start_second_cure(self):
         if self.running:
@@ -562,31 +944,17 @@ class OmnicureGUI:
         # Disable ALL controls immediately
         self.disable_all_controls()
         # Small delay to ensure GUI updates
-        self.root.after(100, lambda: self.start_live(self.second_cure_vars, "Second Cure"))
+        self.root.after(100, lambda: self.start_live("Second Cure"))
 
     def save_first_cure_settings(self):
-        for i, var in enumerate(self.first_cure_entries):
-            self.first_cure_vars[i].set(var.get().strip())
-        self.update_first_cure_blink_time()
-        messagebox.showinfo("✅ Saved", "First cure settings applied successfully!")
+        self._persist_first_cure_settings()
+        self._update_first_cure_display_summary()
+        messagebox.showinfo("✅ Saved", "First cure settings saved successfully!")
 
     def save_second_cure_settings(self):
         for i, var in enumerate(self.second_cure_entries):
             self.second_cure_vars[i].set(var.get().strip())
         messagebox.showinfo("✅ Saved", "Second cure settings applied successfully!")
-
-    def make_first_cure_default(self):
-        pw = simpledialog.askstring("🔐 Password Required", "Enter password to make first cure default:", show='*')
-        if pw != OmnicureGUI.PASSWORD:
-            messagebox.showerror("❌ Authentication Failed", "Incorrect password.")
-            return
-        try:
-            with open(self.settings_file, 'w') as f:
-                for var in self.first_cure_entries:
-                    f.write(var.get().strip() + "\n")
-            messagebox.showinfo("💾 Defaults Saved", "First cure values are now your defaults!")
-        except Exception as e:
-            messagebox.showerror("❌ Error", f"Could not save defaults: {e}")
 
     def make_second_cure_default(self):
         pw = simpledialog.askstring("🔐 Password Required", "Enter password to make second cure default:", show='*')
@@ -600,21 +968,6 @@ class OmnicureGUI:
             messagebox.showinfo("💾 Defaults Saved", "Second cure values are now your defaults!")
         except Exception as e:
             messagebox.showerror("❌ Error", f"Could not save defaults: {e}")
-
-    def revert_first_cure_to_default(self):
-        """Revert first cure values back to default"""
-        pw = simpledialog.askstring("🔐 Password Required", "Enter password to revert first cure to default:", show='*')
-        if pw != OmnicureGUI.PASSWORD:
-            messagebox.showerror("❌ Authentication Failed", "Incorrect password.")
-            return
-        
-        # Set back to default values
-        default_values = ["120", "50", "2", "10"]
-        for i, value in enumerate(default_values):
-            self.first_cure_vars[i].set(value)
-        
-        self.update_first_cure_blink_time()
-        messagebox.showinfo("✅ Reverted", "First cure values reverted to default!")
 
     def revert_second_cure_to_default(self):
         """Revert second cure values back to default"""
@@ -630,23 +983,36 @@ class OmnicureGUI:
         
         messagebox.showinfo("✅ Reverted", "Second cure values reverted to default!")
 
+    def _set_first_cure_settings_state(self, state):
+        if self.first_cure_stay_entry:
+            self.first_cure_stay_entry.configure(state=state)
+        if self.first_cure_save_button:
+            if state == 'normal' and not self.running:
+                self.first_cure_save_button.configure(state='normal')
+            else:
+                self.first_cure_save_button.configure(state='disabled')
+        if self.first_cure_add_step_button:
+            if state == 'normal' and not self.running:
+                self.first_cure_add_step_button.configure(state='normal')
+            else:
+                self.first_cure_add_step_button.configure(state='disabled')
+        if self.first_cure_remove_step_button:
+            if state == 'normal' and not self.running and len(self.first_cure_step_vars) > 1:
+                self.first_cure_remove_step_button.configure(state='normal')
+            else:
+                self.first_cure_remove_step_button.configure(state='disabled')
+        for row in self.first_cure_step_rows:
+            for entry in row.get("entries", []):
+                if entry.cget('state') == 'readonly':
+                    continue
+                entry.configure(state=state)
+
     def disable_all_controls(self):
         """Disable ALL controls except stop button and close option during cure"""
         print("DEBUG: Disabling ALL controls during cure...")
         try:
-            # Disable settings buttons
-            if hasattr(self, 'first_cure_save_button') and self.first_cure_save_button:
-                self.first_cure_save_button.configure(state='disabled')
-                self.first_cure_save_button.configure(text="💾 Save Settings (Disabled)")
-                self.first_cure_save_button.configure(bg='#cccccc', fg='#666666')
-                self.first_cure_save_button.configure(command=lambda: None)
-                
-            if hasattr(self, 'first_cure_revert_button') and self.first_cure_revert_button:
-                self.first_cure_revert_button.configure(state='disabled')
-                self.first_cure_revert_button.configure(text="🔄 Revert to Default (Disabled)")
-                self.first_cure_revert_button.configure(bg='#cccccc', fg='#666666')
-                self.first_cure_revert_button.configure(command=lambda: None)
-                
+            self._set_first_cure_settings_state('disabled')
+
             if hasattr(self, 'second_cure_save_button') and self.second_cure_save_button:
                 self.second_cure_save_button.configure(state='disabled')
                 self.second_cure_save_button.configure(text="💾 Save Settings (Disabled)")
@@ -698,32 +1064,18 @@ class OmnicureGUI:
             # Force GUI update
             self.root.update_idletasks()
             self.root.update()
-            print("DEBUG: ALL controls disabled")
-        except Exception as e:
-            print(f"Error disabling controls: {e}")
+        except Exception:
+            pass
 
     def enable_all_controls(self):
         """Enable ALL controls after cure"""
         # Only enable controls if no cure is currently running
         if self.running:
-            print("DEBUG: Cure still running, not re-enabling controls")
             return
             
-        print("DEBUG: Re-enabling ALL controls...")
         try:
-            # Re-enable settings buttons
-            if hasattr(self, 'first_cure_save_button') and self.first_cure_save_button:
-                self.first_cure_save_button.configure(state='normal')
-                self.first_cure_save_button.configure(text="💾 Save Settings")
-                self.first_cure_save_button.configure(bg=self.colors['success'], fg=self.colors['white'])
-                self.first_cure_save_button.configure(command=self.save_first_cure_settings)
-                
-            if hasattr(self, 'first_cure_revert_button') and self.first_cure_revert_button:
-                self.first_cure_revert_button.configure(state='normal')
-                self.first_cure_revert_button.configure(text="🔄 Revert to Default")
-                self.first_cure_revert_button.configure(bg=self.colors['primary'], fg=self.colors['white'])
-                self.first_cure_revert_button.configure(command=self.revert_first_cure_to_default)
-                
+            self._set_first_cure_settings_state('normal')
+
             if hasattr(self, 'second_cure_save_button') and self.second_cure_save_button:
                 self.second_cure_save_button.configure(state='normal')
                 self.second_cure_save_button.configure(text="💾 Save Settings")
@@ -775,27 +1127,14 @@ class OmnicureGUI:
             # Force GUI update
             self.root.update_idletasks()
             self.root.update()
-            print("DEBUG: ALL controls enabled")
-        except Exception as e:
-            print(f"Error enabling controls: {e}")
+        except Exception:
+            pass
 
     def force_enable_all_controls(self):
         """Force enable ALL controls regardless of cure state"""
-        print("DEBUG: Force re-enabling ALL controls...")
         try:
-            # Re-enable settings buttons
-            if hasattr(self, 'first_cure_save_button') and self.first_cure_save_button:
-                self.first_cure_save_button.configure(state='normal')
-                self.first_cure_save_button.configure(text="💾 Save Settings")
-                self.first_cure_save_button.configure(bg=self.colors['success'], fg=self.colors['white'])
-                self.first_cure_save_button.configure(command=self.save_first_cure_settings)
-                
-            if hasattr(self, 'first_cure_revert_button') and self.first_cure_revert_button:
-                self.first_cure_revert_button.configure(state='normal')
-                self.first_cure_revert_button.configure(text="🔄 Revert to Default")
-                self.first_cure_revert_button.configure(bg=self.colors['primary'], fg=self.colors['white'])
-                self.first_cure_revert_button.configure(command=self.revert_first_cure_to_default)
-                
+            self._set_first_cure_settings_state('normal')
+
             if hasattr(self, 'second_cure_save_button') and self.second_cure_save_button:
                 self.second_cure_save_button.configure(state='normal')
                 self.second_cure_save_button.configure(text="💾 Save Settings")
@@ -847,20 +1186,12 @@ class OmnicureGUI:
             # Force GUI update
             self.root.update_idletasks()
             self.root.update()
-            print("DEBUG: ALL controls force enabled")
-        except Exception as e:
-            print(f"Error force enabling controls: {e}")
+        except Exception:
+            pass
 
     def enable_settings_buttons(self):
         """Legacy method - now calls enable_all_controls"""
         self.enable_all_controls()
-
-    def update_first_cure_blink_time(self):
-        try:
-            freq = float(self.first_cure_vars[2].get())
-            self.first_cure_blink_var.set(f"{1/(2*freq):.2f} sec")
-        except:
-            self.first_cure_blink_var.set("-")
 
     def update_time_display(self, elapsed_seconds, cure_type):
         """Update time display in seconds.milliseconds format"""
@@ -995,10 +1326,9 @@ class OmnicureGUI:
             self.root.after(0, self._update_timing_and_intensity_display, elapsed)
             
             if elapsed >= self.cure_duration:
-                # Cure completed - show final time and stop instrument immediately
                 self.root.after(0, self._update_timing_and_intensity_display, self.cure_duration)
-                # Stop instrument immediately when timing completes
-                self.root.after(0, self._stop_instrument_immediately)
+                if self.current_cure_type != 1:
+                    self.root.after(0, self._stop_instrument_immediately)
                 self.timing_running = False
                 break
             
@@ -1025,30 +1355,41 @@ class OmnicureGUI:
         else:
             self.second_cure_time_var.set(time_str)
 
+    def _stop_lamp_to_zero(self):
+        """Turn lamp off and set intensity to 0% without closing serial connection."""
+        for _ in range(5):
+            self.send_serial("ru=0\r")
+            time.sleep(0.03)
+            self.send_serial("ip=000,000,000,000\r")
+            time.sleep(0.03)
+        self.first_cure_intensity_var.set("0%")
+        if hasattr(self, 'current_intensity'):
+            self.current_intensity = 0
+
+    def _complete_cure_successfully(self, cure_name):
+        """Finish cure: lamp off, 0% intensity, static message, stay connected."""
+        if self.cure_finishing or not self.running:
+            return
+        self.cure_finishing = True
+        self.stop_message_blink()
+        self._stop_lamp_to_zero()
+        self.running = False
+        self.cure_was_started = False
+        self.stop_precise_timing()
+        self.set_cure_frame_running(1, False)
+        self.set_cure_frame_running(2, False)
+        self.current_cure_step = 0
+        self.force_enable_all_controls()
+        self.show_static_message(f"✅ {cure_name} completed successfully!", "success")
+        self.cure_finishing = False
+        if self._is_serial_link_alive():
+            self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
+
     def _stop_instrument_immediately(self):
-        """Stop the instrument immediately when cure completes"""
+        """Stop the instrument when cure completes (second cure / legacy path)."""
         if self.running:
-            # Send stop commands multiple times to ensure they reach the instrument
-            for i in range(3):  # Send stop commands 3 times
-                self.send_serial("ru=0\r")
-                time.sleep(0.02)  # Longer delay
-                self.send_serial("ip=000,000,000,000\r")
-                time.sleep(0.02)  # Longer delay
-            
-            # Determine which cure completed and show specific message
             cure_name = "First Cure" if self.current_cure_step == 1 else "Second Cure"
-            
-            # Update GUI state - keep values but turn off green light
-            self.running = False
-            self.cure_was_started = False  # Reset cure started flag
-            self.stop_precise_timing()
-            self.set_cure_frame_running(1, False)
-            self.set_cure_frame_running(2, False)
-            self.current_cure_step = 0
-            # Don't reset displays - keep the final values visible
-            # Force re-enable ALL controls regardless of cure state
-            self.force_enable_all_controls()
-            self.start_message_blink(f"✅ {cure_name} completed successfully!", "success")
+            self._complete_cure_successfully(cure_name)
 
     def _update_timing_display(self, elapsed_seconds):
         """Update timing display with high precision - seconds only"""
@@ -1137,80 +1478,68 @@ class OmnicureGUI:
         
         self.message_label.config(background=bg_color, foreground=text_color)
 
-    def load_defaults_to_display(self):
-        # Since we set default values directly in StringVars, just update blink time
-        self.update_first_cure_blink_time()
-
     def refresh_com_ports(self):
         """Refresh the list of available COM ports with detailed information"""
         try:
             ports = []
-            port_details = []
-            
-            print("\n=== Scanning for COM Ports ===")
             for port in serial.tools.list_ports.comports():
                 ports.append(port.device)
-                details = f"{port.device}: {port.description or 'Unknown'}"
-                if hasattr(port, 'manufacturer') and port.manufacturer:
-                    details += f" ({port.manufacturer})"
-                port_details.append(details)
-                print(f"  Found: {details}")
             
             # Update the combobox with available ports
             self.com_port_combo['values'] = ports
-            
-            # If no port is selected and ports are available, select the first one
-            if not self.selected_com_port.get() and ports:
+
+            saved_port = self._load_saved_com_port()
+            if saved_port and saved_port in ports:
+                self.selected_com_port.set(saved_port)
+            elif not self.selected_com_port.get() and ports:
                 self.selected_com_port.set(ports[0])
-                print(f"  Auto-selected: {ports[0]}")
             
-            print(f"Total COM ports found: {len(ports)}")
-            print(f"Available COM ports: {ports}")
-            
-            # Update status
-            if ports:
+            if self.serial_connected and self.serial_port:
+                self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
+            elif ports:
                 self.status_var.set(f"🔍 Found {len(ports)} COM port(s): {', '.join(ports)}")
             else:
                 self.status_var.set("❌ No COM ports detected")
             
-        except Exception as e:
-            print(f"Error refreshing COM ports: {e}")
+        except Exception:
             self.com_port_combo['values'] = []
             self.status_var.set("❌ Error scanning COM ports")
 
     def on_com_port_selected(self, event=None):
-        """Handle COM port selection"""
+        """Handle COM port selection without disconnecting."""
         selected_port = self.selected_com_port.get()
         if selected_port:
-            print(f"Selected COM port: {selected_port}")
-            # Disconnect from current port if connected
-            if self.serial_connected and self.serial_port:
-                try:
-                    self.serial_port.close()
-                except:
-                    pass
-                self.serial_port = None
-                self.serial_connected = False
-            
-            # Update status
-            self.status_var.set(f"🔍 Selected {selected_port} - Click Connect to connect")
-            self.show_static_message(f"Selected COM port: {selected_port} - Click 'Connect' to connect", "info")
+            if self.serial_connected and self.serial_port and self.serial_port.port == selected_port:
+                self.status_var.set(f"✅ Connected to OMNICURE LX500 on {selected_port}")
+            else:
+                self.status_var.set(f"🔍 Selected {selected_port} - Click Connect to connect")
+                self.show_static_message(
+                    f"Selected COM port: {selected_port} - Click 'Connect' to connect",
+                    "info",
+                )
 
     def auto_connect_omnicure(self):
-        """Automatically scan and connect to OMNICURE device only"""
-        print("Auto-connecting to OMNICURE device...")
-        self.status_var.set("🔍 Auto-scanning for OMNICURE device...")
-        
-        # Refresh COM ports first
+        """Connect on startup using saved COM port only."""
         self.refresh_com_ports()
-        
-        # Try to find and connect to OMNICURE device
-        if self.find_and_connect_serial():
-            self.show_static_message("✅ OMNICURE device connected automatically!", "success")
-            self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
+        saved_port = self._load_saved_com_port()
+        if saved_port:
+            self.selected_com_port.set(saved_port)
+            self.status_var.set(f"🔌 Connecting to saved port {saved_port}...")
+            if self.find_and_connect_serial(saved_port_only=True):
+                self.show_static_message(f"✅ Connected to saved port {saved_port}", "success")
+                self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
+            else:
+                self.status_var.set(f"❌ Could not connect to saved port {saved_port}")
+                self.show_static_message(
+                    f"⚠️ Could not connect to saved port {saved_port}. Check device and click Connect.",
+                    "warning",
+                )
         else:
-            self.status_var.set("❌ No OMNICURE Device Found")
-            self.show_static_message("⚠️ No OMNICURE LX500 device detected. Please connect the device.", "warning")
+            self.status_var.set("🔍 Select COM port, Connect, then Save Port")
+            self.show_static_message(
+                "Select COM port, click Connect, then Save Port to remember it.",
+                "info",
+            )
 
     def manual_connect_selected_port(self):
         """Manually connect to the selected COM port"""
@@ -1221,18 +1550,26 @@ class OmnicureGUI:
         
         print(f"Manual connection attempt to selected port: {selected_port}")
         self.status_var.set(f"🔌 Connecting to {selected_port}...")
-        
-        # Disconnect from current port if connected
+
+        if (
+            self.serial_connected
+            and self.serial_port
+            and getattr(self.serial_port, 'is_open', False)
+            and self.serial_port.port == selected_port
+        ):
+            self.show_static_message(f"✅ Already connected to {selected_port}", "success")
+            self.status_var.set(f"✅ Connected to OMNICURE LX500 on {selected_port}")
+            return
+
         if self.serial_connected and self.serial_port:
             try:
                 self.serial_port.close()
-            except:
+            except Exception:
                 pass
             self.serial_port = None
             self.serial_connected = False
         
-        # Try to connect to the selected port
-        if self.find_and_connect_serial():
+        if self.find_and_connect_serial(saved_port_only=True):
             self.show_static_message(f"✅ Connected to OMNICURE LX500 on {selected_port}!", "success")
             self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
         else:
@@ -1269,13 +1606,21 @@ class OmnicureGUI:
             self.status_var.set("❌ OMNICURE Device Not Found")
             self.start_message_blink("⚠️ No OMNICURE LX500 device detected. Please connect the correct device.", "warning")
 
-    def find_and_connect_serial(self):
-        if self.serial_port and getattr(self.serial_port, 'is_open', False):
-            try: self.serial_port.close()
-            except: pass
-        
-        # If a specific COM port is selected, try to connect to it first
+    def find_and_connect_serial(self, saved_port_only=False):
         selected_port = self.selected_com_port.get()
+
+        if self._is_serial_link_alive():
+            if not selected_port or self.serial_port.port == selected_port:
+                return True
+
+        if self._is_serial_link_alive() and selected_port and self.serial_port.port != selected_port:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
+            self.serial_port = None
+            self.serial_connected = False
+        
         if selected_port:
             print(f"Attempting to connect to selected port: {selected_port}")
             try:
@@ -1309,8 +1654,15 @@ class OmnicureGUI:
                     print(f"Selected port {selected_port} not found in available ports")
             except Exception as e:
                 print(f"Failed to connect to selected port {selected_port}: {e}")
+
+            if saved_port_only:
+                self.serial_port = None
+                self.serial_connected = False
+                return False
         
-        # If no specific port selected or connection failed, scan all ports
+        if saved_port_only:
+            return False
+
         print("Scanning all available ports for OMNICURE devices...")
         for p in serial.tools.list_ports.comports():
             print(f"\n--- Testing {p.device} ---")
@@ -1351,18 +1703,10 @@ class OmnicureGUI:
         vid = getattr(port, 'vid', None)
         pid = getattr(port, 'pid', None)
 
-        # Print device info for debugging
-        print(f"Checking device: {port.device}")
-        print(f"  Description: {description}")
-        print(f"  Manufacturer: {manufacturer}")
-        print(f"  Product: {product}")
-        print(f"  VID:PID: {vid}:{pid}")
-
         omnicure_identifiers = ['omnicure', 'exfo', 'lx500', 'cure', 'uv', 'light']
 
         for identifier in omnicure_identifiers:
             if (identifier in description or identifier in manufacturer or identifier in product):
-                print(f"  [OK] Found OMNICURE identifier: {identifier}")
                 return True
 
         # Optional VID/PID whitelist (empty by default)
@@ -1370,36 +1714,22 @@ class OmnicureGUI:
         if vid and pid:
             for known_vid, known_pid in omnicure_vid_pid:
                 if vid == known_vid and pid == known_pid:
-                    print(f"  [OK] Found OMNICURE VID:PID: {vid:04x}:{pid:04x}")
                     return True
 
         # Allow generic USB-to-Serial devices to be tested
         if 'usb' in description and ('serial' in description or 'com' in description):
-            if 'ftdi' in manufacturer or 'ftdi' in description:
-                print("  [OK] Potential OMNICURE device (FTDI USB-to-Serial)")
-                return True
-            if 'prolific' in manufacturer or 'prolific' in description:
-                print("  [OK] Potential OMNICURE device (Prolific USB-to-Serial)")
-                return True
-            if 'ch340' in description or 'ch341' in description:
-                print("  [OK] Potential OMNICURE device (CH340/CH341 USB-to-Serial)")
-                return True
-            print("  [OK] Generic USB-to-Serial device - will test connection")
             return True
         
         # Also test any COM port that might be a serial device
         if port.device.startswith('COM'):
-            print("  [OK] COM port detected - will test connection")
             return True
 
         # Unknown device type; allow test
-        print("  ? Unknown device type - will test connection")
         return True
 
     def test_omnicure_connection(self, serial_port):
         """Lenient connection test: accept any responsive serial, or even silent, as valid."""
         try:
-            print(f"Testing connection to {serial_port.port}...")
             serial_port.reset_input_buffer()
             serial_port.reset_output_buffer()
             serial_port.write(b"ip=000,000,000,000\r")
@@ -1407,86 +1737,88 @@ class OmnicureGUI:
             time.sleep(0.2)
             try:
                 response = serial_port.read(50)
-                print(f"  Response: {response}")
                 if response:
                     response_str = response.decode('ascii', errors='ignore').lower()
                     if any(term in response_str for term in ['omnicure', 'exfo', 'lx500', 'cure']):
-                        print("  [OK] Device responded with OMNICURE-like data")
                         return True
                     # Accept any response as valid (matches previous behavior)
-                    print("  [OK] Device responded (accepting as valid)")
                     return True
                 else:
                     # Some devices may not echo; accept as valid to restore connectivity
-                    print("  [OK] No response (accepting as valid OMNICURE)")
                     return True
-            except Exception as e:
-                print(f"  [OK] Error reading response but accepting connection: {e}")
+            except Exception:
                 return True
-        except Exception as e:
-            print(f"  [ERROR] Connection test failed: {e}")
+        except Exception:
             return False
 
+    def _is_serial_link_alive(self):
+        if not self.serial_connected or not self.serial_port:
+            return False
+        if not getattr(self.serial_port, 'is_open', False):
+            return False
+        try:
+            _ = self.serial_port.in_waiting
+            return True
+        except Exception:
+            return False
+
+    def _mark_serial_disconnected(self, status_message, blink_message, stop_cure=False):
+        """Close serial only when the link is actually lost."""
+        try:
+            if self.serial_port:
+                self.serial_port.close()
+        except Exception:
+            pass
+        self.serial_port = None
+        self.serial_connected = False
+        self.status_var.set(status_message)
+        self.start_message_blink(blink_message, "error")
+        if stop_cure and self.running:
+            self._abort_cure_keep_connection_message()
+
+    def _abort_cure_keep_connection_message(self):
+        """Stop an in-progress cure without claiming serial disconnected."""
+        self._stop_lamp_to_zero()
+        self.running = False
+        self.cure_was_started = False
+        self.stop_precise_timing()
+        self.set_cure_frame_running(1, False)
+        self.set_cure_frame_running(2, False)
+        self.current_cure_step = 0
+        self.force_enable_all_controls()
+        self.reset_cure_displays()
+
     def check_serial_health(self):
-        ports = {p.device for p in serial.tools.list_ports.comports()}
+        if self._is_serial_link_alive():
+            self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
+            self.refresh_com_ports()
+            self.root.after(10000, self.check_serial_health)
+            return
+
         was_running = self.running
-
-        if self.serial_connected and self.serial_port:
-            if self.serial_port.port not in ports:
-                try: self.serial_port.close()
-                except: pass
-                self.serial_port = None
-                self.serial_connected = False
-                self.status_var.set("❌ OMNICURE Device Disconnected")
-                self.start_message_blink("🔌 OMNICURE device was unplugged.", "error")
-                if was_running:
-                    self._force_stop()
-            else:
-                # Check if the connected device is still OMNICURE
-                current_port = None
-                for p in serial.tools.list_ports.comports():
-                    if p.device == self.serial_port.port:
-                        current_port = p
-                        break
-                
-                if current_port and not self.is_omnicure_device(current_port):
-                    try: self.serial_port.close()
-                    except: pass
-                    self.serial_port = None
-                    self.serial_connected = False
-                    self.status_var.set("❌ Wrong Device Connected")
-                    self.start_message_blink("⚠️ Non-OMNICURE device detected. Please connect OMNICURE LX500.", "warning")
-                    if was_running:
-                        self._force_stop()
+        if self.serial_connected:
+            self._mark_serial_disconnected(
+                "❌ OMNICURE Device Disconnected",
+                "🔌 OMNICURE device was unplugged.",
+                stop_cure=was_running,
+            )
         else:
-            # Check for OMNICURE devices
-            omnicure_found = False
-            for dev in ports:
-                for p in serial.tools.list_ports.comports():
-                    if p.device == dev and self.is_omnicure_device(p):
-                        omnicure_found = True
-                        try:
-                            sp = serial.Serial(dev, baudrate=19200, timeout=1)
-                            sp.close()
-                            self.show_static_message("", "info")
-                            self.status_var.set("🔍 OMNICURE device detected; click Scan Device")
-                            break
-                        except:
-                            continue
-                if omnicure_found:
-                    break
-            
-            if not omnicure_found:
-                self.status_var.set("❌ No OMNICURE Device Found")
+            saved_port = self._load_saved_com_port()
+            if saved_port:
+                ports = {p.device for p in serial.tools.list_ports.comports()}
+                if saved_port in ports:
+                    self.selected_com_port.set(saved_port)
+                    if self.find_and_connect_serial(saved_port_only=True):
+                        self.status_var.set(f"✅ Connected to OMNICURE LX500 on {saved_port}")
+                    else:
+                        self.status_var.set(f"❌ Could not connect to saved port {saved_port}")
+                else:
+                    self.status_var.set(f"❌ Saved port {saved_port} not available")
+            else:
+                self.status_var.set("🔍 Select COM port, Connect, then Save Port")
 
-        # Refresh COM ports periodically and auto-reconnect if needed
         self.refresh_com_ports()
-        
-        # If not connected, try to auto-connect to OMNICURE device
-        if not self.serial_connected:
-            self.auto_connect_omnicure()
-        
-        self.root.after(5000, self.check_serial_health)  # Check every 5 seconds
+        self.root.after(10000, self.check_serial_health)
 
     def send_serial(self, cmd):
         if self.serial_connected and self.serial_port:
@@ -1501,30 +1833,26 @@ class OmnicureGUI:
                 # Small delay for command processing
                 time.sleep(0.05)
                 
-            except Exception as e:
-                print(f"Serial communication error: {e}")
+            except Exception:
                 # Don't mark as disconnected for single command failures
                 pass
 
     def stop_action(self):
-        # Send multiple stop commands to ensure instrument stops
-        self.send_serial("ru=0\r")
-        time.sleep(0.01)
-        self.send_serial("ip=000,000,000,000\r")
-        time.sleep(0.01)
-        self.send_serial("ru=0\r")  # Send again to be sure
-        
+        self.stop_message_blink()
+        self.cure_finishing = True
+        self._stop_lamp_to_zero()
         self.running = False
-        self.cure_was_started = False  # Reset cure started flag
+        self.cure_was_started = False
         self.stop_precise_timing()
         self.set_cure_frame_running(1, False)
         self.set_cure_frame_running(2, False)
         self.current_cure_step = 0
-        # Reset displays
         self.reset_cure_displays()
-        # Force re-enable ALL controls regardless of cure state
         self.force_enable_all_controls()
+        self.cure_finishing = False
         self.show_static_message("🛑 Cure stopped by user", "warning")
+        if self._is_serial_link_alive():
+            self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
 
     def set_cure_frame_running(self, cure_number, is_running):
         """Change the color of cure frames when running"""
@@ -1541,44 +1869,31 @@ class OmnicureGUI:
             frame.configure(style="Modern.TLabelframe")
 
     def _force_stop(self):
-        # Send multiple stop commands to ensure instrument stops
-        self.send_serial("ru=0\r")
-        time.sleep(0.01)
-        self.send_serial("ip=000,000,000,000\r")
-        time.sleep(0.01)
-        self.send_serial("ru=0\r")  # Send again to be sure
-        
-        self.running = False
-        self.cure_was_started = False  # Reset cure started flag
-        self.stop_precise_timing()
-        self.set_cure_frame_running(1, False)
-        self.set_cure_frame_running(2, False)
-        self.current_cure_step = 0
-        # Reset displays
-        self.reset_cure_displays()
-        # Force re-enable ALL controls regardless of cure state
-        self.force_enable_all_controls()
-        self.start_message_blink("🛑 Cure stopped due to disconnection.", "error")
+        """Legacy name: stop cure on unexpected abort; keeps serial open if still alive."""
+        self._abort_cure_keep_connection_message()
+        if not self._is_serial_link_alive():
+            self.show_static_message("🛑 Cure stopped — device connection lost.", "error")
+        else:
+            self.show_static_message("🛑 Cure stopped.", "warning")
+            if self.serial_port:
+                self.status_var.set(f"✅ Connected to OMNICURE LX500 on {self.serial_port.port}")
 
-    def start_live(self, cure_vars, cure_name):
+    def start_live(self, cure_name):
         if self.running:
             messagebox.showinfo("ℹ️ Info", "Already running.")
             return
         self.show_static_message("", "info")
+        self.cure_finishing = False
         
         # Reset displays
         self.reset_cure_displays()
 
         try:
             if self.current_cure_step == 1:
-                # First cure - always pulsed mode
-                total = float(cure_vars[0].get())
-                pct = float(cure_vars[1].get())
-                freq = float(cure_vars[2].get())
-                ramp = float(cure_vars[3].get())
+                stay_at_100, first_cure_steps = self._parse_first_cure_settings()
             else:
                 # Second cure - continuous mode
-                total = float(cure_vars[0].get())  # 60 seconds
+                total = float(self.second_cure_vars[0].get())  # 60 seconds
                 pct = 100  # 100% intensity
                 freq = 0   # continuous
                 ramp = 0   # no ramp
@@ -1600,11 +1915,9 @@ class OmnicureGUI:
         def worker():
             self.running = True
             self.cure_was_started = True  # Mark that cure was actually started
-            print("DEBUG: Cure worker started, cure_was_started = True")
             
             if self.current_cure_step == 1:
-                # First cure - always pulsed mode
-                self._run_first_cure_pulsed(total, pct, freq, ramp, cure_name)
+                self._run_first_cure_pulsed(first_cure_steps, stay_at_100, cure_name)
             else:
                 # Second cure - continuous mode
                 self._run_second_cure(total, cure_name)
@@ -1612,158 +1925,129 @@ class OmnicureGUI:
         self.live_thread = threading.Thread(target=worker, daemon=True)
         self.live_thread.start()
 
-    def _run_first_cure_pulsed(self, total, pct, freq, ramp, cure_name):
-        """Run first cure in pulsed mode with proper step-by-step intensity ramping"""
-        ramp_start = 5
-        pulse_time = total * (pct / 100)  # Total time for pulsed phase
-        cw_time = total - pulse_time      # Remaining time for CW phase
-        
-        # Calculate steps: First step (5% to 10%) + stay at 10% + subsequent steps (20% to 100% in 10% increments)
-        # First step: 5% to 10% (ramp)
-        # Second step: stay at 10% for 6 seconds
-        # Subsequent steps: 20%, 30%, 40%, ..., 100% (10% each)
-        ramp_steps = 1  # Step to ramp from 5% to 10%
-        stay_at_10_step = 1  # Extra step to stay at 10%
-        subsequent_steps = int((100 - 20) / ramp)  # (100 - 20) / 10 = 8 steps
-        total_steps = ramp_steps + stay_at_10_step + subsequent_steps  # 1 + 1 + 8 = 10 steps
-        
-        # Calculate time per step
-        time_per_step = pulse_time / total_steps
-        
-        # Pulsing timing
-        on_t = 1 / (2 * freq) if freq > 0 else 0.1
-        off_t = on_t
+    def _run_first_cure_pulsed(self, steps, stay_at_100_time, cure_name):
+        """Run first cure using step-based ON/OFF timing and ramp increments."""
+        sequence = self._build_first_cure_pulse_sequence(steps)
+        total = self._estimate_first_cure_duration(steps, stay_at_100_time)
 
-        # Start high-precision timing from the beginning
-        self.start_precise_timing_with_intensity(total, 1, ramp_start)
-        
-        # Track elapsed time during pulsed phase
-        pulsed_start_time = time.perf_counter()
-        elapsed_pulsed = 0
+        self.first_cure_intensity_var.set("0%")
+        self.current_intensity = 0
+        self.start_precise_timing_with_intensity(total, 1, 5)
 
-        # Process each step
-        for step in range(total_steps):
+        for intensity, on_time, off_time in sequence:
             if not self.running:
-                self._force_stop()
                 return
-                
-            # Calculate start and target intensity for this step
-            if step == 0:
-                # First step: 5% to 10% (ramp)
-                step_start_intensity = ramp_start  # 5%
-                step_target_intensity = 10  # 10%
-            elif step == 1:
-                # Second step: stay at 10%
-                step_start_intensity = 10  # 10%
-                step_target_intensity = 10  # 10%
-            else:
-                # Subsequent steps: 20%, 30%, 40%, etc.
-                step_start_intensity = 20 + ((step - 2) * ramp)  # 20%, 30%, 40%, etc.
-                step_target_intensity = step_start_intensity  # Stay at 20%, 30%, 40%, etc.
-                
-            if step_target_intensity > 100:
-                step_target_intensity = 100
-                
-            # Calculate time for this step
-            step_start_time = time.perf_counter()
-            step_elapsed = 0
-            
-            # Run this step for the allocated time
-            while step_elapsed < time_per_step and elapsed_pulsed < pulse_time:
-                if not self.running:
-                    self._force_stop()
-                    return
-                    
-                # Calculate current intensity within this step
-                if step == 0:
-                    # First step: ramp from 5% to 10% (5% increase over 6 seconds)
-                    # Increase by 1% every 1.2 seconds (6 seconds / 5 increments)
-                    small_step_time = time_per_step / 5  # 1.2 seconds per 1% increment
-                    small_step = int(step_elapsed / small_step_time)
-                    current_intensity = step_start_intensity + small_step
-                    if current_intensity > step_target_intensity:
-                        current_intensity = step_target_intensity
-                elif step == 1:
-                    # Second step: stay at 10% for the full 6 seconds
-                    current_intensity = 10
-                else:
-                    # Subsequent steps: stay at the target intensity for the full 6 seconds
-                    # For step 2: stay at 20% for 6 seconds
-                    # For step 3: stay at 30% for 6 seconds, etc.
-                    current_intensity = step_target_intensity
-                    
-                # Set current intensity
-                self.send_serial(f"ip={int(current_intensity):03},000,000,000\r")
-                self.send_serial("ru=1\r")
-                
-                # Update intensity display
-                self.first_cure_intensity_var.set(f"{int(current_intensity)}%")
-                self.current_intensity = int(current_intensity)
-                
-                # Pulse ON
-                pulse_start = time.perf_counter()
-                while time.perf_counter() - pulse_start < on_t and step_elapsed < time_per_step:
-                    if not self.running:
-                        self._force_stop()
-                        return
-                    step_elapsed = time.perf_counter() - step_start_time
-                    elapsed_pulsed = time.perf_counter() - pulsed_start_time
-                    
-                self.send_serial("ru=0\r")
-                
-                # Pulse OFF
-                pulse_start = time.perf_counter()
-                while time.perf_counter() - pulse_start < off_t and step_elapsed < time_per_step:
-                    if not self.running:
-                        self._force_stop()
-                        return
-                    step_elapsed = time.perf_counter() - step_start_time
-                    elapsed_pulsed = time.perf_counter() - pulsed_start_time
 
-        # CW phase - continue with 100% intensity for remaining time
-        self.send_serial(f"ip=100,000,000,000\r")
-        self.send_serial("ru=1\r")
-        # Set intensity to 100% for CW phase
-        self.first_cure_intensity_var.set("100%")
-        # Update the intensity in the timing system
-        self.current_intensity = 100
-        
-        # Timing thread will handle completion automatically
+            self.send_serial(f"ip={int(intensity):03},000,000,000\r")
+            self.first_cure_intensity_var.set(f"{int(intensity)}%")
+            self.current_intensity = int(intensity)
+
+            self.send_serial("ru=1\r")
+            on_start = time.perf_counter()
+            while time.perf_counter() - on_start < on_time:
+                if not self.running:
+                    return
+
+            self.send_serial("ru=0\r")
+            off_start = time.perf_counter()
+            while time.perf_counter() - off_start < off_time:
+                if not self.running:
+                    return
+
+        if stay_at_100_time > 0:
+            self.send_serial("ip=100,000,000,000\r")
+            self.send_serial("ru=1\r")
+            self.first_cure_intensity_var.set("100%")
+            self.current_intensity = 100
+
+            hold_start = time.perf_counter()
+            while self.running and not self.cure_finishing:
+                if time.perf_counter() - hold_start >= stay_at_100_time:
+                    break
+                self.send_serial("ru=1\r")
+                time.sleep(0.1)
+
+        if self.running:
+            self.root.after(0, lambda: self._complete_cure_successfully("First Cure"))
 
     def _run_first_cure_continuous(self, total, cure_name):
         """Run first cure in continuous mode"""
-        # Continuous mode at 100% intensity
+        # Continuous mode at 100% intensity - keep it ON continuously
         self.send_serial("ip=100,000,000,000\r")
         self.send_serial("ru=1\r")
         
         # Set intensity to 100%
         self.first_cure_intensity_var.set("100%")
+        self.current_intensity = 100
         
         # Start high-precision timing with intensity tracking
         self.start_precise_timing_with_intensity(total, 1, 100)
         
-        # Timing thread will handle completion automatically
+        # Keep UV head ON continuously for the full duration - no pulsing, no blinking
+        start_time = time.perf_counter()
+        while self.running:
+            elapsed = time.perf_counter() - start_time
+            
+            # Check if time is complete
+            if elapsed >= total:
+                break
+            
+            # Continuously keep UV head ON - send command periodically to ensure it stays ON
+            self.send_serial("ru=1\r")
+            time.sleep(0.1)  # Small delay to avoid flooding serial port
+        
+        # Timing thread will handle final stop automatically
 
     def _run_second_cure(self, total, cure_name):
         """Run second cure in continuous mode"""
-        # Continuous mode at 100% intensity
-        self.send_serial("ip=100,000,000,000\r")
+        # Get intensity from settings (default 100%)
+        intensity = float(self.second_cure_vars[1].get())  # Intensity setting
+        
+        # Set intensity and turn on UV head - keep it ON continuously
+        intensity_str = f"{int(intensity):03}"
+        self.send_serial(f"ip={intensity_str},000,000,000\r")
         self.send_serial("ru=1\r")
         
-        # Start high-precision timing
+        # Start timing
         self.start_precise_timing(total, 2)
         
-        # Timing thread will handle completion automatically
+        # Keep UV head ON continuously for the full duration - no pulsing, no blinking
+        start_time = time.perf_counter()
+        while self.running:
+            elapsed = time.perf_counter() - start_time
+            
+            # Check if time is complete
+            if elapsed >= total:
+                break
+            
+            # Continuously keep UV head ON - send command periodically to ensure it stays ON
+            self.send_serial("ru=1\r")
+            time.sleep(0.1)  # Small delay to avoid flooding serial port
+        
+        # Timing thread will handle final stop automatically
 
     def on_closing(self):
         if self.running:
             if not messagebox.askokcancel("⚠️ Quit", "Cure running—exit?"):
                 return
-            # Force stop the instrument before closing
-            self._force_stop()
+            self.stop_action()
+        elif self._is_serial_link_alive():
+            self._stop_lamp_to_zero()
+        self._persist_first_cure_settings()
+        if self.serial_port:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
         self.root.destroy()
 
 if __name__ == '__main__':
     root = tk.Tk()
     app = OmnicureGUI(root)
+    # Ensure window is visible
+    root.update()
+    root.deiconify()  # Make sure window is not minimized
+    root.lift()  # Bring to front
+    root.attributes('-topmost', True)
+    root.after(100, lambda: root.attributes('-topmost', False))
     root.mainloop()

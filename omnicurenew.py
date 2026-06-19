@@ -11,6 +11,7 @@ import ctypes
 
 class OmnicureGUI:
     PASSWORD = "1234@"  # password required for second cure settings
+    FIRST_CURE_START_INTENSITY = 1
 
     def __init__(self, root):
         self.root = root
@@ -48,6 +49,7 @@ class OmnicureGUI:
         self.first_cure_settings_file = self._get_lensing_settings_path()
         self.connection_settings_file = self._get_connection_settings_path()
         self._loading_first_cure_settings = False
+        self.first_cure_total_var = tk.StringVar(value="")
         self.first_cure_stay_var = tk.StringVar(value="")
         self.first_cure_steps_summary_var = tk.StringVar(value="")
         self.first_cure_step_vars = []
@@ -57,7 +59,7 @@ class OmnicureGUI:
         self.first_cure_add_step_button = None
         self.first_cure_remove_step_button = None
         self.first_cure_save_button = None
-        self.first_cure_stay_entry = None
+        self.first_cure_total_entry = None
         self.first_cure_intensity_var = tk.StringVar(value="0%")
         self.first_cure_time_var = tk.StringVar(value="0.000")
         self._init_first_cure_settings()
@@ -303,13 +305,19 @@ class OmnicureGUI:
             messagebox.showinfo("✅ Saved", f"COM port {port} saved. App will use this port on startup.")
 
     def _default_first_cure_step_data(self):
-        return {"intensity": "5", "on_time": "", "off_time": "", "increment": "1"}
+        return {
+            "intensity": str(self.FIRST_CURE_START_INTENSITY),
+            "on_time": "",
+            "off_time": "",
+            "increment": "1",
+        }
 
     def _init_first_cure_settings(self):
         self._loading_first_cure_settings = True
         self._load_first_cure_settings_from_file()
         self._build_first_cure_step_vars(self._stored_first_cure_steps)
         self._loading_first_cure_settings = False
+        self._recalculate_computed_stay()
         self._update_first_cure_display_summary()
 
     def _load_first_cure_settings_from_file(self):
@@ -318,7 +326,7 @@ class OmnicureGUI:
             if os.path.exists(self.first_cure_settings_file):
                 with open(self.first_cure_settings_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                stay = str(data.get("stay_at_100", "")).strip()
+                total = str(data.get("total_cure_time", "")).strip()
                 steps = data.get("steps", default_steps) or default_steps
                 cleaned = []
                 for step in steps:
@@ -330,13 +338,13 @@ class OmnicureGUI:
                     })
                 if not cleaned:
                     cleaned = default_steps
-                cleaned[0]["intensity"] = "5"
-                self.first_cure_stay_var.set(stay)
+                cleaned[0]["intensity"] = str(self.FIRST_CURE_START_INTENSITY)
+                self.first_cure_total_var.set(total)
                 self._stored_first_cure_steps = cleaned
                 return
         except Exception:
             pass
-        self.first_cure_stay_var.set("")
+        self.first_cure_total_var.set("")
         self._stored_first_cure_steps = default_steps
 
     def _build_first_cure_step_vars(self, steps_data):
@@ -354,14 +362,15 @@ class OmnicureGUI:
             step_vars["increment"].trace_add("write", self._on_first_cure_setting_changed)
             self.first_cure_step_vars.append(step_vars)
         if self.first_cure_step_vars:
-            self.first_cure_step_vars[0]["intensity"].set("5")
-        self.first_cure_stay_var.trace_add("write", self._on_first_cure_setting_changed)
+            self.first_cure_step_vars[0]["intensity"].set(str(self.FIRST_CURE_START_INTENSITY))
+        self.first_cure_total_var.trace_add("write", self._on_first_cure_setting_changed)
 
     def _on_first_cure_setting_changed(self, *_args):
         if self._loading_first_cure_settings:
             return
         if self.first_cure_step_vars:
-            self.first_cure_step_vars[0]["intensity"].set("5")
+            self.first_cure_step_vars[0]["intensity"].set(str(self.FIRST_CURE_START_INTENSITY))
+        self._recalculate_computed_stay()
         self._persist_first_cure_settings()
         self._update_first_cure_display_summary()
 
@@ -375,9 +384,9 @@ class OmnicureGUI:
                 "increment": step["increment"].get().strip() or "1",
             })
         if steps:
-            steps[0]["intensity"] = "5"
+            steps[0]["intensity"] = str(self.FIRST_CURE_START_INTENSITY)
         data = {
-            "stay_at_100": self.first_cure_stay_var.get().strip(),
+            "total_cure_time": self.first_cure_total_var.get().strip(),
             "steps": steps,
         }
         try:
@@ -385,6 +394,77 @@ class OmnicureGUI:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+
+    def _format_first_cure_time_value(self, seconds):
+        if abs(seconds - round(seconds)) < 0.0005:
+            return str(int(round(seconds)))
+        return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+    def _parse_first_cure_steps_only(self):
+        if not self.first_cure_step_vars:
+            raise ValueError("Please configure at least one cure step.")
+
+        steps = []
+        start_intensity = self.FIRST_CURE_START_INTENSITY
+        for i, step in enumerate(self.first_cure_step_vars, start=1):
+            intensity_raw = step["intensity"].get().strip()
+            on_raw = step["on_time"].get().strip()
+            off_raw = step["off_time"].get().strip()
+            inc_raw = step["increment"].get().strip() or "1"
+            if not on_raw or not off_raw:
+                raise ValueError(f"Please enter ON and OFF time for step {i}.")
+            if i > 1 and not intensity_raw:
+                raise ValueError(f"Please enter intensity for step {i}.")
+            intensity = float(intensity_raw if intensity_raw else str(start_intensity))
+            on_time = float(on_raw)
+            off_time = float(off_raw)
+            increment = float(inc_raw)
+            if on_time <= 0 or off_time <= 0 or increment <= 0:
+                raise ValueError(f"Step {i} values must be greater than zero.")
+            steps.append({
+                "intensity": intensity,
+                "on_time": on_time,
+                "off_time": off_time,
+                "increment": increment,
+            })
+
+        steps.sort(key=lambda s: s["intensity"])
+        if steps[0]["intensity"] != start_intensity:
+            raise ValueError(f"First step intensity must be {start_intensity}%.")
+        for i in range(1, len(steps)):
+            if steps[i]["intensity"] <= steps[i - 1]["intensity"]:
+                raise ValueError(
+                    f"Step intensities must increase (e.g. {start_intensity}, 10, 20)."
+                )
+        return steps
+
+    def _estimate_ramp_pulse_time(self, steps):
+        sequence = self._build_first_cure_pulse_sequence(steps)
+        return sum(on_t + off_t for _, on_t, off_t in sequence)
+
+    def _recalculate_computed_stay(self):
+        total_raw = self.first_cure_total_var.get().strip()
+        if not total_raw:
+            self.first_cure_stay_var.set("")
+            return
+        try:
+            total = float(total_raw)
+            if total <= 0:
+                self.first_cure_stay_var.set("Invalid total time")
+                return
+            steps = self._parse_first_cure_steps_only()
+            ramp_time = self._estimate_ramp_pulse_time(steps)
+            stay = total - ramp_time
+            if stay < 0:
+                self.first_cure_stay_var.set(
+                    f"Invalid (ramp {self._format_first_cure_time_value(ramp_time)}s > total)"
+                )
+            else:
+                self.first_cure_stay_var.set(self._format_first_cure_time_value(stay))
+        except ValueError as exc:
+            self.first_cure_stay_var.set(str(exc))
+        except Exception:
+            self.first_cure_stay_var.set("")
 
     def _update_first_cure_display_summary(self):
         lines = []
@@ -400,47 +480,23 @@ class OmnicureGUI:
         self.first_cure_steps_summary_var.set(summary)
 
     def _parse_first_cure_settings(self):
-        stay_raw = self.first_cure_stay_var.get().strip()
-        if not stay_raw:
-            raise ValueError("Please enter Stay at 100% Intensity Time (sec)")
-        stay_at_100 = float(stay_raw)
+        total_raw = self.first_cure_total_var.get().strip()
+        if not total_raw:
+            raise ValueError("Please enter Total Cure Time (sec)")
+        total_time = float(total_raw)
+        if total_time <= 0:
+            raise ValueError("Total cure time must be greater than zero.")
+
+        steps = self._parse_first_cure_steps_only()
+        ramp_time = self._estimate_ramp_pulse_time(steps)
+        stay_at_100 = total_time - ramp_time
         if stay_at_100 < 0:
-            raise ValueError("Stay at 100% time cannot be negative.")
+            raise ValueError(
+                f"Total time ({total_time:g}s) is shorter than ramp time "
+                f"({ramp_time:g}s). Increase total time or reduce step ON/OFF times."
+            )
 
-        if not self.first_cure_step_vars:
-            raise ValueError("Please configure at least one cure step.")
-
-        steps = []
-        for i, step in enumerate(self.first_cure_step_vars, start=1):
-            intensity_raw = step["intensity"].get().strip()
-            on_raw = step["on_time"].get().strip()
-            off_raw = step["off_time"].get().strip()
-            inc_raw = step["increment"].get().strip() or "1"
-            if not on_raw or not off_raw:
-                raise ValueError(f"Please enter ON and OFF time for step {i}.")
-            if i > 1 and not intensity_raw:
-                raise ValueError(f"Please enter intensity for step {i}.")
-            intensity = float(intensity_raw if intensity_raw else "5")
-            on_time = float(on_raw)
-            off_time = float(off_raw)
-            increment = float(inc_raw)
-            if on_time <= 0 or off_time <= 0 or increment <= 0:
-                raise ValueError(f"Step {i} values must be greater than zero.")
-            steps.append({
-                "intensity": intensity,
-                "on_time": on_time,
-                "off_time": off_time,
-                "increment": increment,
-            })
-
-        steps.sort(key=lambda s: s["intensity"])
-        if steps[0]["intensity"] != 5:
-            raise ValueError("First step intensity must be 5%.")
-        for i in range(1, len(steps)):
-            if steps[i]["intensity"] <= steps[i - 1]["intensity"]:
-                raise ValueError("Step intensities must increase (e.g. 5, 10, 20).")
-
-        return stay_at_100, steps
+        return total_time, stay_at_100, steps
 
     def _build_first_cure_pulse_sequence(self, steps):
         sequence = []
@@ -469,10 +525,8 @@ class OmnicureGUI:
                     sequence.append((100, step["on_time"], step["off_time"]))
         return sequence
 
-    def _estimate_first_cure_duration(self, steps, stay_at_100):
-        sequence = self._build_first_cure_pulse_sequence(steps)
-        pulse_time = sum(on_t + off_t for _, on_t, off_t in sequence)
-        return pulse_time + stay_at_100
+    def _estimate_first_cure_duration(self, total_time):
+        return total_time
 
     def _update_first_cure_step_count(self):
         self.first_cure_step_count_var.set(f"({len(self.first_cure_step_vars)})")
@@ -626,24 +680,29 @@ class OmnicureGUI:
         first_disp_frame = ttk.Frame(first_cure_frame, style="Main.TFrame")
         first_disp_frame.pack(fill='both', expand=True, padx=15, pady=10)
 
-        ttk.Label(first_disp_frame, text="Stay at 100% Intensity Time (sec):", style="Header.TLabel")\
+        ttk.Label(first_disp_frame, text="Total Cure Time (sec):", style="Header.TLabel")\
             .grid(row=0, column=0, sticky='w', padx=10, pady=8)
-        ttk.Label(first_disp_frame, textvariable=self.first_cure_stay_var, style="Value.TLabel")\
+        ttk.Label(first_disp_frame, textvariable=self.first_cure_total_var, style="Value.TLabel")\
             .grid(row=0, column=1, sticky='w', padx=10, pady=8)
 
+        ttk.Label(first_disp_frame, text="Stay at 100% Time (sec, auto):", style="Header.TLabel")\
+            .grid(row=1, column=0, sticky='w', padx=10, pady=8)
+        ttk.Label(first_disp_frame, textvariable=self.first_cure_stay_var, style="Value.TLabel")\
+            .grid(row=1, column=1, sticky='w', padx=10, pady=8)
+
         ttk.Label(first_disp_frame, text="Cure Steps:", style="Header.TLabel")\
-            .grid(row=1, column=0, sticky='nw', padx=10, pady=8)
+            .grid(row=2, column=0, sticky='nw', padx=10, pady=8)
         ttk.Label(
             first_disp_frame,
             textvariable=self.first_cure_steps_summary_var,
             style="Value.TLabel",
             justify='left'
-        ).grid(row=1, column=1, sticky='w', padx=10, pady=8)
+        ).grid(row=2, column=1, sticky='w', padx=10, pady=8)
 
         # Current intensity display in separate frame
         intensity_frame = ttk.LabelFrame(first_disp_frame, text="⚡ Current Intensity", 
                                         style="Modern.TLabelframe")
-        intensity_frame.grid(row=2, column=0, columnspan=2, 
+        intensity_frame.grid(row=3, column=0, columnspan=2, 
                             sticky='ew', padx=10, pady=8)
         intensity_label = ttk.Label(intensity_frame, textvariable=self.first_cure_intensity_var, 
                                    style="Value.TLabel")
@@ -652,7 +711,7 @@ class OmnicureGUI:
         # Elapsed time display in separate frame
         time_frame = ttk.LabelFrame(first_disp_frame, text="⏱️ Elapsed Time", 
                                    style="Modern.TLabelframe")
-        time_frame.grid(row=3, column=0, columnspan=2, 
+        time_frame.grid(row=4, column=0, columnspan=2, 
                        sticky='ew', padx=10, pady=8)
         time_label = ttk.Label(time_frame, textvariable=self.first_cure_time_var, 
                               style="Value.TLabel")
@@ -763,15 +822,26 @@ class OmnicureGUI:
         settings_container = ttk.Frame(self.first_cure_settings_frame, style="Settings.TFrame")
         settings_container.pack(fill='both', expand=True, padx=30, pady=10)
 
-        stay_frame = ttk.Frame(settings_container, style="Settings.TFrame")
-        stay_frame.pack(fill='x', pady=(0, 15))
-        ttk.Label(stay_frame, text="Stay at 100% Intensity Time (sec)",
+        total_frame = ttk.Frame(settings_container, style="Settings.TFrame")
+        total_frame.pack(fill='x', pady=(0, 10))
+        ttk.Label(total_frame, text="Total Cure Time (sec)",
                  font=('Arial', 10),
                  foreground=self.colors['text'],
                  background=self.colors['light']).pack(anchor='w', pady=(0, 5))
-        self.first_cure_stay_entry = ttk.Entry(stay_frame, textvariable=self.first_cure_stay_var,
-                                              width=25, style="Modern.TEntry")
-        self.first_cure_stay_entry.pack(fill='x', pady=5)
+        self.first_cure_total_entry = ttk.Entry(total_frame, textvariable=self.first_cure_total_var,
+                                               width=25, style="Modern.TEntry")
+        self.first_cure_total_entry.pack(fill='x', pady=5)
+
+        stay_frame = ttk.Frame(settings_container, style="Settings.TFrame")
+        stay_frame.pack(fill='x', pady=(0, 15))
+        ttk.Label(stay_frame, text="Stay at 100% Time (sec, auto-calculated)",
+                 font=('Arial', 10),
+                 foreground=self.colors['text'],
+                 background=self.colors['light']).pack(anchor='w', pady=(0, 5))
+        ttk.Label(stay_frame, textvariable=self.first_cure_stay_var,
+                 font=('Arial', 10, 'bold'),
+                 foreground=self.colors['primary'],
+                 background=self.colors['light']).pack(anchor='w', pady=5)
 
         steps_header_bar = ttk.Frame(settings_container, style="Settings.TFrame")
         steps_header_bar.pack(fill='x', pady=(10, 5))
@@ -984,8 +1054,8 @@ class OmnicureGUI:
         messagebox.showinfo("✅ Reverted", "Second cure values reverted to default!")
 
     def _set_first_cure_settings_state(self, state):
-        if self.first_cure_stay_entry:
-            self.first_cure_stay_entry.configure(state=state)
+        if self.first_cure_total_entry:
+            self.first_cure_total_entry.configure(state=state)
         if self.first_cure_save_button:
             if state == 'normal' and not self.running:
                 self.first_cure_save_button.configure(state='normal')
@@ -1890,7 +1960,7 @@ class OmnicureGUI:
 
         try:
             if self.current_cure_step == 1:
-                stay_at_100, first_cure_steps = self._parse_first_cure_settings()
+                total_time, stay_at_100, first_cure_steps = self._parse_first_cure_settings()
             else:
                 # Second cure - continuous mode
                 total = float(self.second_cure_vars[0].get())  # 60 seconds
@@ -1917,7 +1987,7 @@ class OmnicureGUI:
             self.cure_was_started = True  # Mark that cure was actually started
             
             if self.current_cure_step == 1:
-                self._run_first_cure_pulsed(first_cure_steps, stay_at_100, cure_name)
+                self._run_first_cure_pulsed(first_cure_steps, stay_at_100, total_time, cure_name)
             else:
                 # Second cure - continuous mode
                 self._run_second_cure(total, cure_name)
@@ -1925,14 +1995,15 @@ class OmnicureGUI:
         self.live_thread = threading.Thread(target=worker, daemon=True)
         self.live_thread.start()
 
-    def _run_first_cure_pulsed(self, steps, stay_at_100_time, cure_name):
-        """Run first cure using step-based ON/OFF timing and ramp increments."""
+    def _run_first_cure_pulsed(self, steps, stay_at_100_time, total_time, cure_name):
+        """Run first cure: ramp 1%→100% pulsing, then pulse at 100% for remaining time."""
         sequence = self._build_first_cure_pulse_sequence(steps)
-        total = self._estimate_first_cure_duration(steps, stay_at_100_time)
+        last_on = steps[-1]["on_time"]
+        last_off = steps[-1]["off_time"]
 
         self.first_cure_intensity_var.set("0%")
         self.current_intensity = 0
-        self.start_precise_timing_with_intensity(total, 1, 5)
+        self.start_precise_timing_with_intensity(total_time, 1, self.FIRST_CURE_START_INTENSITY)
 
         for intensity, on_time, off_time in sequence:
             if not self.running:
@@ -1956,7 +2027,6 @@ class OmnicureGUI:
 
         if stay_at_100_time > 0:
             self.send_serial("ip=100,000,000,000\r")
-            self.send_serial("ru=1\r")
             self.first_cure_intensity_var.set("100%")
             self.current_intensity = 100
 
@@ -1964,8 +2034,21 @@ class OmnicureGUI:
             while self.running and not self.cure_finishing:
                 if time.perf_counter() - hold_start >= stay_at_100_time:
                     break
+
                 self.send_serial("ru=1\r")
-                time.sleep(0.1)
+                on_start = time.perf_counter()
+                while time.perf_counter() - on_start < last_on:
+                    if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
+                        break
+
+                if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
+                    break
+
+                self.send_serial("ru=0\r")
+                off_start = time.perf_counter()
+                while time.perf_counter() - off_start < last_off:
+                    if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
+                        break
 
         if self.running:
             self.root.after(0, lambda: self._complete_cure_successfully("First Cure"))

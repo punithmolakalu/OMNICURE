@@ -11,7 +11,6 @@ import ctypes
 
 class OmnicureGUI:
     PASSWORD = "1234@"  # password required for second cure settings
-    FIRST_CURE_START_INTENSITY = 1
 
     def __init__(self, root):
         self.root = root
@@ -306,7 +305,7 @@ class OmnicureGUI:
 
     def _default_first_cure_step_data(self):
         return {
-            "intensity": str(self.FIRST_CURE_START_INTENSITY),
+            "intensity": "5",
             "on_time": "",
             "off_time": "",
             "increment": "1",
@@ -338,7 +337,6 @@ class OmnicureGUI:
                     })
                 if not cleaned:
                     cleaned = default_steps
-                cleaned[0]["intensity"] = str(self.FIRST_CURE_START_INTENSITY)
                 self.first_cure_total_var.set(total)
                 self._stored_first_cure_steps = cleaned
                 return
@@ -361,15 +359,11 @@ class OmnicureGUI:
             step_vars["off_time"].trace_add("write", self._on_first_cure_setting_changed)
             step_vars["increment"].trace_add("write", self._on_first_cure_setting_changed)
             self.first_cure_step_vars.append(step_vars)
-        if self.first_cure_step_vars:
-            self.first_cure_step_vars[0]["intensity"].set(str(self.FIRST_CURE_START_INTENSITY))
         self.first_cure_total_var.trace_add("write", self._on_first_cure_setting_changed)
 
     def _on_first_cure_setting_changed(self, *_args):
         if self._loading_first_cure_settings:
             return
-        if self.first_cure_step_vars:
-            self.first_cure_step_vars[0]["intensity"].set(str(self.FIRST_CURE_START_INTENSITY))
         self._recalculate_computed_stay()
         self._persist_first_cure_settings()
         self._update_first_cure_display_summary()
@@ -383,8 +377,6 @@ class OmnicureGUI:
                 "off_time": step["off_time"].get().strip(),
                 "increment": step["increment"].get().strip() or "1",
             })
-        if steps:
-            steps[0]["intensity"] = str(self.FIRST_CURE_START_INTENSITY)
         data = {
             "total_cure_time": self.first_cure_total_var.get().strip(),
             "steps": steps,
@@ -405,20 +397,21 @@ class OmnicureGUI:
             raise ValueError("Please configure at least one cure step.")
 
         steps = []
-        start_intensity = self.FIRST_CURE_START_INTENSITY
         for i, step in enumerate(self.first_cure_step_vars, start=1):
             intensity_raw = step["intensity"].get().strip()
             on_raw = step["on_time"].get().strip()
             off_raw = step["off_time"].get().strip()
             inc_raw = step["increment"].get().strip() or "1"
+            if not intensity_raw:
+                raise ValueError(f"Please enter intensity for step {i}.")
             if not on_raw or not off_raw:
                 raise ValueError(f"Please enter ON and OFF time for step {i}.")
-            if i > 1 and not intensity_raw:
-                raise ValueError(f"Please enter intensity for step {i}.")
-            intensity = float(intensity_raw if intensity_raw else str(start_intensity))
+            intensity = float(intensity_raw)
             on_time = float(on_raw)
             off_time = float(off_raw)
             increment = float(inc_raw)
+            if intensity < 1 or intensity > 100:
+                raise ValueError(f"Step {i} intensity must be between 1% and 100%.")
             if on_time <= 0 or off_time <= 0 or increment <= 0:
                 raise ValueError(f"Step {i} values must be greater than zero.")
             steps.append({
@@ -429,13 +422,9 @@ class OmnicureGUI:
             })
 
         steps.sort(key=lambda s: s["intensity"])
-        if steps[0]["intensity"] != start_intensity:
-            raise ValueError(f"First step intensity must be {start_intensity}%.")
         for i in range(1, len(steps)):
             if steps[i]["intensity"] <= steps[i - 1]["intensity"]:
-                raise ValueError(
-                    f"Step intensities must increase (e.g. {start_intensity}, 10, 20)."
-                )
+                raise ValueError("Step intensities must increase (e.g. 5, 10, 20).")
         return steps
 
     def _estimate_ramp_pulse_time(self, steps):
@@ -590,9 +579,6 @@ class OmnicureGUI:
             )
             inc_entry.grid(row=grid_row, column=4, padx=4, pady=2, sticky="ew")
             widgets.append(inc_entry)
-
-            if index == 0:
-                intensity_entry.configure(state="readonly")
 
             self.first_cure_step_rows.append({
                 "widgets": widgets,
@@ -1427,11 +1413,9 @@ class OmnicureGUI:
 
     def _stop_lamp_to_zero(self):
         """Turn lamp off and set intensity to 0% without closing serial connection."""
-        for _ in range(5):
+        for _ in range(3):
             self.send_serial("ru=0\r")
-            time.sleep(0.03)
             self.send_serial("ip=000,000,000,000\r")
-            time.sleep(0.03)
         self.first_cure_intensity_var.set("0%")
         if hasattr(self, 'current_intensity'):
             self.current_intensity = 0
@@ -1705,7 +1689,15 @@ class OmnicureGUI:
                     # Check if this is an OMNICURE device
                     if self.is_omnicure_device(target_port):
                         try:
-                            sp = serial.Serial(target_port.device, baudrate=19200, timeout=2, write_timeout=2)
+                            sp = serial.Serial(
+                                target_port.device,
+                                baudrate=19200,
+                                bytesize=serial.EIGHTBITS,
+                                parity=serial.PARITY_NONE,
+                                stopbits=serial.STOPBITS_ONE,
+                                timeout=2,
+                                write_timeout=2,
+                            )
                             # Send a test command to verify it's responding
                             if self.test_omnicure_connection(sp):
                                 self.serial_port = sp
@@ -1740,7 +1732,15 @@ class OmnicureGUI:
             if self.is_omnicure_device(p):
                 try:
                     print(f"Attempting connection to {p.device}...")
-                    sp = serial.Serial(p.device, baudrate=19200, timeout=2, write_timeout=2)
+                    sp = serial.Serial(
+                        p.device,
+                        baudrate=19200,
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=2,
+                        write_timeout=2,
+                    )
                     # Send a test command to verify it's responding
                     if self.test_omnicure_connection(sp):
                         self.serial_port = sp
@@ -1798,28 +1798,104 @@ class OmnicureGUI:
         return True
 
     def test_omnicure_connection(self, serial_port):
-        """Lenient connection test: accept any responsive serial, or even silent, as valid."""
+        """Verify the LX500 responds to connect and intensity commands."""
         try:
             serial_port.reset_input_buffer()
             serial_port.reset_output_buffer()
+            serial_port.write(b"co\r")
+            serial_port.flush()
+            time.sleep(0.1)
+            if serial_port.in_waiting:
+                serial_port.read(serial_port.in_waiting)
             serial_port.write(b"ip=000,000,000,000\r")
             serial_port.flush()
-            time.sleep(0.2)
-            try:
-                response = serial_port.read(50)
-                if response:
-                    response_str = response.decode('ascii', errors='ignore').lower()
-                    if any(term in response_str for term in ['omnicure', 'exfo', 'lx500', 'cure']):
-                        return True
-                    # Accept any response as valid (matches previous behavior)
-                    return True
-                else:
-                    # Some devices may not echo; accept as valid to restore connectivity
-                    return True
-            except Exception:
-                return True
+            time.sleep(0.1)
+            if serial_port.in_waiting:
+                serial_port.read(serial_port.in_waiting)
+            return True
         except Exception:
             return False
+
+    def send_serial(self, cmd, delay=0.1):
+        """Send an OMNICURE command and wait for the device to process it."""
+        if not self._is_serial_link_alive():
+            return ""
+        try:
+            self.serial_port.reset_input_buffer()
+            self.serial_port.write(cmd.encode("ascii"))
+            self.serial_port.flush()
+            time.sleep(delay)
+            waiting = self.serial_port.in_waiting
+            if waiting:
+                return self.serial_port.read(waiting).decode("ascii", errors="ignore").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _send_lamp_relay(self, on):
+        """Send lamp ON/OFF without the full command delay (for keep-alive during holds)."""
+        if not self._is_serial_link_alive():
+            return
+        try:
+            self.serial_port.write(("ru=1\r" if on else "ru=0\r").encode("ascii"))
+            self.serial_port.flush()
+        except Exception:
+            pass
+
+    def _set_omnicure_intensity(self, intensity_pct):
+        """Set head 1 intensity (0-100%) using LX500 ip= command format."""
+        intensity_pct = max(0, min(100, int(round(intensity_pct))))
+        self.send_serial(f"ip={intensity_pct:03},000,000,000\r")
+        self.current_intensity = intensity_pct
+        self.first_cure_intensity_var.set(f"{intensity_pct}%")
+
+    def _hold_lamp_relay(self, on, duration_sec):
+        """Keep lamp ON or OFF for duration, re-sending relay command during the hold."""
+        if duration_sec <= 0 or not self.running:
+            return
+        self._send_lamp_relay(on)
+        end_time = time.perf_counter() + duration_sec
+        while self.running and time.perf_counter() < end_time:
+            time.sleep(0.1)
+            if time.perf_counter() < end_time:
+                self._send_lamp_relay(on)
+
+    def _first_cure_pulse_once(self, intensity_pct, on_time, off_time):
+        """One ON/OFF pulse at the given intensity."""
+        if not self.running:
+            return
+        self._set_omnicure_intensity(intensity_pct)
+        self._send_lamp_relay(True)
+        self._hold_lamp_relay(True, on_time)
+        if not self.running:
+            return
+        self._send_lamp_relay(False)
+        self._hold_lamp_relay(False, off_time)
+
+    def _first_cure_pulse_at_intensity_until(self, intensity_pct, on_time, off_time, deadline):
+        """Pulse ON/OFF at fixed intensity until perf_counter reaches deadline."""
+        while self.running and time.perf_counter() < deadline:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            self._set_omnicure_intensity(intensity_pct)
+            on_duration = min(on_time, remaining)
+            self._send_lamp_relay(True)
+            self._hold_lamp_relay(True, on_duration)
+            if not self.running or time.perf_counter() >= deadline:
+                break
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            off_duration = min(off_time, remaining)
+            self._send_lamp_relay(False)
+            self._hold_lamp_relay(False, off_duration)
+
+    def _prepare_omnicure_for_cure(self):
+        """Connect session and ensure lamp starts from OFF at 0%."""
+        self.send_serial("co\r")
+        self.send_serial("ru=0\r")
+        self._set_omnicure_intensity(0)
 
     def _is_serial_link_alive(self):
         if not self.serial_connected or not self.serial_port:
@@ -1889,23 +1965,6 @@ class OmnicureGUI:
 
         self.refresh_com_ports()
         self.root.after(10000, self.check_serial_health)
-
-    def send_serial(self, cmd):
-        if self.serial_connected and self.serial_port:
-            try:
-                # Clear input buffer before sending
-                self.serial_port.reset_input_buffer()
-                
-                # Send command
-                self.serial_port.write(cmd.encode())
-                self.serial_port.flush()
-                
-                # Small delay for command processing
-                time.sleep(0.05)
-                
-            except Exception:
-                # Don't mark as disconnected for single command failures
-                pass
 
     def stop_action(self):
         self.stop_message_blink()
@@ -1996,59 +2055,29 @@ class OmnicureGUI:
         self.live_thread.start()
 
     def _run_first_cure_pulsed(self, steps, stay_at_100_time, total_time, cure_name):
-        """Run first cure: ramp 1%→100% pulsing, then pulse at 100% for remaining time."""
+        """Run first cure: ramp from step 1 intensity to 100%, then pulse at 100%."""
         sequence = self._build_first_cure_pulse_sequence(steps)
         last_on = steps[-1]["on_time"]
         last_off = steps[-1]["off_time"]
+        start_intensity = int(steps[0]["intensity"])
 
         self.first_cure_intensity_var.set("0%")
         self.current_intensity = 0
-        self.start_precise_timing_with_intensity(total_time, 1, self.FIRST_CURE_START_INTENSITY)
+        self.start_precise_timing_with_intensity(total_time, 1, start_intensity)
+
+        self._prepare_omnicure_for_cure()
+        if not self.running:
+            return
 
         for intensity, on_time, off_time in sequence:
             if not self.running:
                 return
+            self._first_cure_pulse_once(intensity, on_time, off_time)
 
-            self.send_serial(f"ip={int(intensity):03},000,000,000\r")
-            self.first_cure_intensity_var.set(f"{int(intensity)}%")
-            self.current_intensity = int(intensity)
-
-            self.send_serial("ru=1\r")
-            on_start = time.perf_counter()
-            while time.perf_counter() - on_start < on_time:
-                if not self.running:
-                    return
-
-            self.send_serial("ru=0\r")
-            off_start = time.perf_counter()
-            while time.perf_counter() - off_start < off_time:
-                if not self.running:
-                    return
-
-        if stay_at_100_time > 0:
-            self.send_serial("ip=100,000,000,000\r")
-            self.first_cure_intensity_var.set("100%")
-            self.current_intensity = 100
-
-            hold_start = time.perf_counter()
-            while self.running and not self.cure_finishing:
-                if time.perf_counter() - hold_start >= stay_at_100_time:
-                    break
-
-                self.send_serial("ru=1\r")
-                on_start = time.perf_counter()
-                while time.perf_counter() - on_start < last_on:
-                    if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
-                        break
-
-                if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
-                    break
-
-                self.send_serial("ru=0\r")
-                off_start = time.perf_counter()
-                while time.perf_counter() - off_start < last_off:
-                    if not self.running or time.perf_counter() - hold_start >= stay_at_100_time:
-                        break
+        if stay_at_100_time > 0 and self.running:
+            stay_deadline = time.perf_counter() + stay_at_100_time
+            self._first_cure_pulse_at_intensity_until(100, last_on, last_off, stay_deadline)
+            self._send_lamp_relay(False)
 
         if self.running:
             self.root.after(0, lambda: self._complete_cure_successfully("First Cure"))
